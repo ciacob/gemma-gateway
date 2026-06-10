@@ -3,9 +3,9 @@
 /**
  * Ollama HTTP client factory.
  *
- * Accepts an optional `httpClient` function with the same signature as
- * the global `fetch`. Defaults to the global fetch so production code
- * needs no changes. Tests inject a mock to avoid network calls entirely.
+ * Accepts an optional `httpClient` function with the same signature as the
+ * global `fetch`. Defaults to the global fetch so production code needs no
+ * changes. Tests inject a mock to avoid network calls entirely.
  */
 
 function createOllamaClient({
@@ -47,6 +47,37 @@ function createOllamaClient({
     return 'audio/mpeg'
   }
 
+  /**
+   * Build the messages array, prepending a system turn when provided.
+   * System turn always comes first, before any history.
+   */
+  function buildMessages({ text, image, audio, history, system }) {
+    const messages = []
+
+    if (system) {
+      messages.push({ role: 'system', content: system })
+    }
+
+    for (const turn of history) {
+      messages.push(turn)
+    }
+
+    const userMessage = { role: 'user', content: text }
+
+    if (image) {
+      userMessage.images = [bufferToBase64(image)]
+    }
+
+    if (audio) {
+      const mime    = detectAudioMime(audio)
+      const dataUri = `data:${mime};base64,${bufferToBase64(audio)}`
+      userMessage.content = `${text}\n\n[audio](${dataUri})`
+    }
+
+    messages.push(userMessage)
+    return messages
+  }
+
   // -------------------------------------------------------------------------
   // Public API
   // -------------------------------------------------------------------------
@@ -71,33 +102,28 @@ function createOllamaClient({
    * Send a chat request and return the full assistant reply as a string.
    *
    * @param {Object}  opts
-   * @param {string}  opts.text       User text prompt
-   * @param {Buffer}  [opts.image]    Raw image bytes
-   * @param {Buffer}  [opts.audio]    Raw audio bytes
-   * @param {Array}   [opts.history]  Prior turns: [{role, content}]
+   * @param {string}  opts.text          User text prompt
+   * @param {Buffer}  [opts.image]       Raw image bytes
+   * @param {Buffer}  [opts.audio]       Raw audio bytes
+   * @param {Array}   [opts.history]     Prior turns: [{role, content}]
+   * @param {string}  [opts.system]      System prompt (prepended before history)
+   * @param {Object}  [opts.options]     Ollama inference parameters (temperature, etc.)
    */
-  async function chat({ text, image, audio, history = [] }) {
-    const userMessage = { role: 'user', content: text }
+  async function chat({ text, image, audio, history = [], system, options } = {}) {
+    const messages = buildMessages({ text, image, audio, history, system })
 
-    if (image) {
-      userMessage.images = [bufferToBase64(image)]
-    }
-
-    if (audio) {
-      const mime    = detectAudioMime(audio)
-      const dataUri = `data:${mime};base64,${bufferToBase64(audio)}`
-      userMessage.content = `${text}\n\n[audio](${dataUri})`
-    }
-
-    const messages = [...history, userMessage]
-
-    const res = await post('/api/chat', {
+    const body = {
       model,
       keep_alive: `${keepAlive}s`,
       stream:     false,
       messages,
-    })
+    }
 
+    if (options && typeof options === 'object') {
+      body.options = options
+    }
+
+    const res  = await post('/api/chat', body)
     const json = await res.json()
     return json.message?.content ?? ''
   }
@@ -105,24 +131,21 @@ function createOllamaClient({
   /**
    * Same as chat() but streams tokens back via an async generator.
    */
-  async function* chatStream({ text, image, audio, history = [] }) {
-    const userMessage = { role: 'user', content: text }
-    if (image) userMessage.images = [bufferToBase64(image)]
-    if (audio) {
-      const mime    = detectAudioMime(audio)
-      const dataUri = `data:${mime};base64,${bufferToBase64(audio)}`
-      userMessage.content = `${text}\n\n[audio](${dataUri})`
-    }
+  async function* chatStream({ text, image, audio, history = [], system, options } = {}) {
+    const messages = buildMessages({ text, image, audio, history, system })
 
-    const messages = [...history, userMessage]
-
-    const res = await post('/api/chat', {
+    const body = {
       model,
       keep_alive: `${keepAlive}s`,
       stream:     true,
       messages,
-    })
+    }
 
+    if (options && typeof options === 'object') {
+      body.options = options
+    }
+
+    const res     = await post('/api/chat', body)
     const reader  = res.body.getReader()
     const decoder = new TextDecoder()
 

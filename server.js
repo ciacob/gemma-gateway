@@ -10,6 +10,7 @@ const { ModelManager }        = require('./src/modelManager')
 const { createQueue }         = require('./src/queue')
 const { createSessionStore }  = require('./src/sessions')
 const { createRoutes }        = require('./src/routes')
+const { createPersonaManager } = require('./src/personas')
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10)
 const HOST = process.env.HOST ?? '127.0.0.1'
@@ -23,7 +24,8 @@ function buildApp() {
   const ollamaClient  = createOllamaClient()
   const modelManager  = new ModelManager({ ollamaClient })
   const queue         = createQueue()
-  const sessionStore  = createSessionStore()
+  const sessionStore   = createSessionStore()
+  const personaManager = createPersonaManager()
 
   const app = Fastify({
     logger: {
@@ -35,7 +37,7 @@ function buildApp() {
   })
 
   app.register(multipart)
-  app.register(createRoutes({ ollamaClient, modelManager, sessionStore, queue }))
+  app.register(createRoutes({ ollamaClient, modelManager, sessionStore, queue, personaManager }))
 
   app.setErrorHandler((err, req, reply) => {
     const status = err.statusCode ?? err.status ?? 500

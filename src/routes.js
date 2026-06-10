@@ -7,10 +7,12 @@
  * use Fastify's app.inject() without any real I/O.
  *
  * @param {Object} deps
- * @param {Object} deps.ollamaClient    { chat, chatStream }
- * @param {Object} deps.modelManager   { ensureLoaded, touch, forceUnload, status }
- * @param {Object} deps.sessionStore   { create, resolve, appendAndMaybeCompress, remove, status }
- * @param {Object} deps.queue          { enqueue, stats }
+ * @param {Object} deps.ollamaClient     { chat, chatStream }
+ * @param {Object} deps.modelManager    { ensureLoaded, touch, forceUnload, status }
+ * @param {Object} deps.sessionStore    { create, resolve, appendAndMaybeCompress, remove, status }
+ * @param {Object} deps.queue           { enqueue, stats }
+ * @param {Object} deps.personaManager  { load, list }
+ * @param {string} [deps.defaultPersona]
  * @param {number} [deps.maxUploadBytes]
  */
 
@@ -19,8 +21,22 @@ function createRoutes({
   modelManager,
   sessionStore,
   queue,
-  maxUploadBytes = parseInt(process.env.MAX_UPLOAD_BYTES ?? '52428800', 10),
+  personaManager,
+  defaultPersona  = process.env.DEFAULT_PERSONA ?? '',
+  maxUploadBytes  = parseInt(process.env.MAX_UPLOAD_BYTES ?? '52428800', 10),
 }) {
+
+  // -------------------------------------------------------------------------
+  // Helper: resolve a persona name → { system?, options? }
+  // Returns {} when no persona is requested and no default is set.
+  // Throws {statusCode:424} when a named persona file is missing or invalid.
+  // -------------------------------------------------------------------------
+
+  function resolvePersona(requestedName) {
+    const name = requestedName || defaultPersona || null
+    if (!name) return {}
+    return personaManager.load(name)
+  }
 
   // -------------------------------------------------------------------------
   // Helper: run a task through the queue + model lifecycle
@@ -45,8 +61,9 @@ function createRoutes({
     // GET /status
     // ------------------------------------------------------------------
     app.get('/status', async () => ({
-      model: modelManager.status(),
-      queue: queue.stats(),
+      model:    modelManager.status(),
+      queue:    queue.stats(),
+      personas: personaManager.list(),
     }))
 
     // ------------------------------------------------------------------
@@ -68,14 +85,28 @@ function createRoutes({
           properties: {
             prompt:  { type: 'string', minLength: 1 },
             history: { type: 'array' },
+            persona: { type: 'string' },
+            options: { type: 'object' },
           },
         },
       },
     }, async (req, reply) => {
-      const { prompt, history } = req.body
+      const { prompt, history, persona: personaName, options: reqOptions } = req.body
+
+      let personaData
+      try {
+        personaData = resolvePersona(personaName)
+      } catch (err) {
+        return reply.status(err.statusCode ?? 424).send({ error: err.message })
+      }
+
+      // Per-request options override persona options
+      const options = reqOptions ?? personaData.options
+
       const reply_text = await run(() =>
-        ollamaClient.chat({ text: prompt, history })
+        ollamaClient.chat({ text: prompt, history, system: personaData.system, options })
       )
+
       reply.send({ reply: reply_text })
     })
 
@@ -90,18 +121,31 @@ function createRoutes({
           properties: {
             prompt:  { type: 'string' },
             history: { type: 'array' },
+            persona: { type: 'string' },
+            options: { type: 'object' },
           },
         },
       },
     }, async (req, reply) => {
-      const { prompt, history } = req.body
+      const { prompt, history, persona: personaName, options: reqOptions } = req.body
+
+      let personaData
+      try {
+        personaData = resolvePersona(personaName)
+      } catch (err) {
+        return reply.status(err.statusCode ?? 424).send({ error: err.message })
+      }
+
+      const options = reqOptions ?? personaData.options
 
       reply.raw.setHeader('Content-Type', 'text/event-stream')
       reply.raw.setHeader('Cache-Control', 'no-cache')
       reply.raw.setHeader('Connection', 'keep-alive')
 
       await run(async () => {
-        for await (const token of ollamaClient.chatStream({ text: prompt, history })) {
+        for await (const token of ollamaClient.chatStream({
+          text: prompt, history, system: personaData.system, options
+        })) {
           reply.raw.write(`data: ${JSON.stringify({ token })}\n\n`)
         }
         reply.raw.write('data: [DONE]\n\n')
@@ -118,6 +162,8 @@ function createRoutes({
       let imageBuffer = null
       let prompt      = 'Describe this image.'
       let history     = []
+      let personaName = null
+      let reqOptions  = null
 
       for await (const part of parts) {
         if (part.type === 'file' && part.fieldname === 'image') {
@@ -125,7 +171,11 @@ function createRoutes({
           for await (const chunk of part.file) chunks.push(chunk)
           imageBuffer = Buffer.concat(chunks)
         } else if (part.type === 'field') {
-          if (part.fieldname === 'prompt')  prompt  = part.value
+          if (part.fieldname === 'prompt')  prompt      = part.value
+          if (part.fieldname === 'persona') personaName = part.value
+          if (part.fieldname === 'options') {
+            try { reqOptions = JSON.parse(part.value) } catch { /* ignore */ }
+          }
           if (part.fieldname === 'history') {
             try { history = JSON.parse(part.value) } catch { /* ignore */ }
           }
@@ -136,8 +186,17 @@ function createRoutes({
         return reply.status(400).send({ error: 'Missing image file (field: image)' })
       }
 
+      let personaData
+      try {
+        personaData = resolvePersona(personaName)
+      } catch (err) {
+        return reply.status(err.statusCode ?? 424).send({ error: err.message })
+      }
+
+      const options = reqOptions ?? personaData.options
+
       const reply_text = await run(() =>
-        ollamaClient.chat({ text: prompt, image: imageBuffer, history })
+        ollamaClient.chat({ text: prompt, image: imageBuffer, history, system: personaData.system, options })
       )
       reply.send({ reply: reply_text })
     })
@@ -150,14 +209,20 @@ function createRoutes({
 
       let audioBuffer = null
       let prompt      = 'Transcribe this audio accurately.'
+      let personaName = null
+      let reqOptions  = null
 
       for await (const part of parts) {
         if (part.type === 'file' && part.fieldname === 'audio') {
           const chunks = []
           for await (const chunk of part.file) chunks.push(chunk)
           audioBuffer = Buffer.concat(chunks)
-        } else if (part.type === 'field' && part.fieldname === 'prompt') {
-          prompt = part.value
+        } else if (part.type === 'field') {
+          if (part.fieldname === 'prompt')  prompt      = part.value
+          if (part.fieldname === 'persona') personaName = part.value
+          if (part.fieldname === 'options') {
+            try { reqOptions = JSON.parse(part.value) } catch { /* ignore */ }
+          }
         }
       }
 
@@ -165,8 +230,17 @@ function createRoutes({
         return reply.status(400).send({ error: 'Missing audio file (field: audio)' })
       }
 
+      let personaData
+      try {
+        personaData = resolvePersona(personaName)
+      } catch (err) {
+        return reply.status(err.statusCode ?? 424).send({ error: err.message })
+      }
+
+      const options = reqOptions ?? personaData.options
+
       const reply_text = await run(() =>
-        ollamaClient.chat({ text: prompt, audio: audioBuffer })
+        ollamaClient.chat({ text: prompt, audio: audioBuffer, system: personaData.system, options })
       )
       reply.send({ reply: reply_text })
     })
@@ -180,14 +254,24 @@ function createRoutes({
           type: 'object',
           required: ['prompt'],
           properties: {
-            prompt: { type: 'string', minLength: 1 },
-            uid:    { type: 'string' },
-            cache:  { type: 'boolean' },
+            prompt:  { type: 'string', minLength: 1 },
+            uid:     { type: 'string' },
+            cache:   { type: 'boolean' },
+            persona: { type: 'string' },
+            options: { type: 'object' },
           },
         },
       },
     }, async (req, reply) => {
-      const { prompt, uid: incomingUid, cache = true } = req.body
+      const { prompt, uid: incomingUid, cache = true, persona: personaName, options: reqOptions } = req.body
+
+      // Resolve persona before touching session state
+      let personaData
+      try {
+        personaData = resolvePersona(personaName)
+      } catch (err) {
+        return reply.status(err.statusCode ?? 424).send({ error: err.message })
+      }
 
       let session, uid, isNew = false, volatile = false
 
@@ -201,19 +285,42 @@ function createRoutes({
         uid      = incomingUid
         volatile = !session.cached
       } else {
-        const created = sessionStore.create(cache)
+        // Store persona name in session so it survives resume
+        const created = sessionStore.create(cache, personaName || defaultPersona || null)
         uid      = created.uid
         session  = created.session
         isNew    = true
         volatile = !cache
       }
 
+      // On resume, use the persona the session was created with, unless overridden
+      const effectivePersonaName = personaName
+        || (incomingUid ? session.personaName : null)
+        || defaultPersona
+        || null
+
+      let effectivePersona = personaData
+      if (incomingUid && !personaName && effectivePersonaName) {
+        try {
+          effectivePersona = personaManager.load(effectivePersonaName)
+        } catch {
+          effectivePersona = {}
+        }
+      }
+
+      const options = reqOptions ?? effectivePersona.options
+
       const replyText = await run(() =>
-        ollamaClient.chat({ text: prompt, history: session.history })
+        ollamaClient.chat({
+          text:    prompt,
+          history: session.history,
+          system:  effectivePersona.system,
+          options,
+        })
       )
 
       const contextUsage = await sessionStore.appendAndMaybeCompress(
-        uid, prompt, replyText, ollamaClient.chat.bind(ollamaClient)
+        uid, prompt, replyText, (opts) => ollamaClient.chat({ ...opts, system: effectivePersona.system })
       )
 
       const response = { uid, reply: replyText, context_usage: contextUsage }
@@ -231,11 +338,9 @@ function createRoutes({
     app.delete('/context_chat/:uid', async (req, reply) => {
       const { uid } = req.params
       const deleted = sessionStore.remove(uid)
-
       if (!deleted) {
         return reply.status(404).send({ error: `Session '${uid}' not found.` })
       }
-
       reply.send({ ok: true, uid, deleted: true })
     })
 
@@ -245,13 +350,19 @@ function createRoutes({
     app.get('/context_chat/:uid', async (req, reply) => {
       const { uid } = req.params
       const snap = sessionStore.status(uid)
-
       if (!snap) {
         return reply.status(404).send({ error: `Session '${uid}' not found.` })
       }
-
       reply.send(snap)
     })
+
+    // ------------------------------------------------------------------
+    // GET /personas — list available personas
+    // ------------------------------------------------------------------
+    app.get('/personas', async () => ({
+      personas: personaManager.list(),
+      default:  defaultPersona || null,
+    }))
 
   }
 

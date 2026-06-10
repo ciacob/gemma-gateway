@@ -147,9 +147,9 @@ function createSessionStore({
   // Public API
   // -------------------------------------------------------------------------
 
-  function create(cached = true) {
+  function create(cached = true, personaName = null) {
     const uid     = uuidFn()
-    const session = { uid, history: [], cached, createdAt: now(), updatedAt: now() }
+    const session = { uid, history: [], cached, personaName, createdAt: now(), updatedAt: now() }
     store.set(uid, session)
     if (cached) writeToDisk(uid, session)
     return { uid, session }

@@ -113,6 +113,55 @@ describe('ollama client', () => {
       )
     })
 
+
+    it('prepends system prompt as first message', async () => {
+      const http = mockHttp({ message: { content: 'ok' } })
+      const client = createOllamaClient({ httpClient: http })
+      await client.chat({ text: 'Hi', system: 'Be concise.' })
+
+      const messages = http.calls[0].body.messages
+      assert.equal(messages[0].role, 'system')
+      assert.equal(messages[0].content, 'Be concise.')
+      assert.equal(messages[1].role, 'user')
+    })
+
+    it('system prompt appears before history', async () => {
+      const http = mockHttp({ message: { content: 'ok' } })
+      const client = createOllamaClient({ httpClient: http })
+      const history = [{ role: 'user', content: 'prev' }, { role: 'assistant', content: 'reply' }]
+      await client.chat({ text: 'Next', system: 'Be terse.', history })
+
+      const messages = http.calls[0].body.messages
+      assert.equal(messages[0].role, 'system')
+      assert.equal(messages[1].role, 'user')    // history[0]
+      assert.equal(messages[2].role, 'assistant')
+      assert.equal(messages[3].role, 'user')    // current prompt
+    })
+
+    it('sends inference options in request body', async () => {
+      const http = mockHttp({ message: { content: 'ok' } })
+      const client = createOllamaClient({ httpClient: http })
+      await client.chat({ text: 'Hi', options: { temperature: 0.3, top_p: 0.9 } })
+
+      assert.deepEqual(http.calls[0].body.options, { temperature: 0.3, top_p: 0.9 })
+    })
+
+    it('omits options key when not provided', async () => {
+      const http = mockHttp({ message: { content: 'ok' } })
+      const client = createOllamaClient({ httpClient: http })
+      await client.chat({ text: 'Hi' })
+
+      assert.equal(http.calls[0].body.options, undefined)
+    })
+
+    it('omits system message when not provided', async () => {
+      const http = mockHttp({ message: { content: 'ok' } })
+      const client = createOllamaClient({ httpClient: http })
+      await client.chat({ text: 'Hi' })
+
+      const messages = http.calls[0].body.messages
+      assert.ok(messages.every(m => m.role !== 'system'))
+    })
     it('returns empty string when response has no message content', async () => {
       const http = mockHttp({})
       const client = createOllamaClient({ httpClient: http })

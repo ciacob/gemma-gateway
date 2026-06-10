@@ -4,9 +4,10 @@ const { describe, it } = require('node:test')
 const assert    = require('node:assert/strict')
 const Fastify   = require('fastify')
 const multipart = require('@fastify/multipart')
-const { createRoutes }       = require('../src/routes')
-const { createSessionStore } = require('../src/sessions')
-const { createQueue }        = require('../src/queue')
+const { createRoutes }         = require('../src/routes')
+const { createSessionStore }   = require('../src/sessions')
+const { createQueue }          = require('../src/queue')
+const { createPersonaManager } = require('../src/personas')
 
 // ---------------------------------------------------------------------------
 // Mock builders
@@ -33,11 +34,31 @@ function makeModelManager() {
 function makeFakeFs() {
   const files = new Map()
   return {
-    existsSync:    (p) => files.has(p),
+    existsSync:    (p) => files.has(p) || [...files.keys()].some(k => k.startsWith(p + '/')),
     mkdirSync:     ()  => {},
     writeFileSync: (p, d) => files.set(p, d),
     readFileSync:  (p) => { if (!files.has(p)) throw new Error('ENOENT'); return files.get(p) },
     unlinkSync:    (p) => files.delete(p),
+    readdirSync:   (p) => [...files.keys()].filter(k => k.startsWith(p + '/')).map(k => k.slice(p.length + 1)),
+  }
+}
+
+// Persona filesystem: { personaName: { system?, options?, ... } }
+function makePersonaFs(personas = {}) {
+  const dir   = '/fake/personas'
+  const files = new Map(
+    Object.entries(personas).map(([name, data]) => [
+      `${dir}/${name}.json`,
+      JSON.stringify(data),
+    ])
+  )
+  return {
+    dir,
+    fs: {
+      existsSync:   (p) => files.has(p) || [...files.keys()].some(k => k.startsWith(p + '/')),
+      readFileSync: (p) => { if (!files.has(p)) throw new Error('ENOENT'); return files.get(p) },
+      readdirSync:  (p) => [...files.keys()].filter(k => k.startsWith(p + '/')).map(k => k.slice(p.length + 1)),
+    },
   }
 }
 
@@ -47,7 +68,7 @@ function makeFakeFs() {
 
 let _uidSeq = 0
 
-async function buildTestApp(ollamaOverride) {
+async function buildTestApp(ollamaOverride, personaOpts = {}) {
   const ollama       = ollamaOverride ?? makeOllama()
   const modelManager = makeModelManager()
   const queue        = createQueue({ concurrency: 1, maxSize: 20 })
@@ -56,12 +77,17 @@ async function buildTestApp(ollamaOverride) {
     uuidFn: () => `test-uid-${++_uidSeq}`,
     cacheDir: '/fake/sessions',
   })
+  const { dir, fs: pFs } = makePersonaFs(personaOpts.personas ?? {})
+  const personaManager   = createPersonaManager({ fs: pFs, personasDir: dir })
+  const defaultPersona   = personaOpts.defaultPersona ?? ''
 
   const app = Fastify({ logger: false })
   app.register(multipart)
-  app.register(createRoutes({ ollamaClient: ollama, modelManager, sessionStore, queue }))
+  app.register(createRoutes({
+    ollamaClient: ollama, modelManager, sessionStore, queue, personaManager, defaultPersona,
+  }))
   await app.ready()
-  return { app, ollama, modelManager, sessionStore }
+  return { app, ollama, modelManager, sessionStore, personaManager }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,14 +157,14 @@ describe('routes', () => {
     })
 
     it('returns 429 when queue is full', async () => {
-      // maxSize:0 means every enqueue throws synchronously — no async work,
-      // no event-loop leak, and the route must translate the throw to HTTP 429.
       const fullQueue    = createQueue({ concurrency: 1, maxSize: 0 })
       const modelManager = makeModelManager()
       const sessionStore = createSessionStore({ fs: makeFakeFs(), cacheDir: '/fake' })
+      const { dir, fs: pFs } = makePersonaFs({})
+      const personaManager   = createPersonaManager({ fs: pFs, personasDir: dir })
       const app = Fastify({ logger: false })
       app.register(multipart)
-      app.register(createRoutes({ ollamaClient: makeOllama(), modelManager, sessionStore, queue: fullQueue }))
+      app.register(createRoutes({ ollamaClient: makeOllama(), modelManager, sessionStore, queue: fullQueue, personaManager }))
       await app.ready()
 
       const res = await app.inject({
@@ -267,6 +293,137 @@ describe('routes', () => {
       const { app } = await buildTestApp()
       const res = await app.inject({ method: 'GET', url: '/context_chat/ghost' })
       assert.equal(res.statusCode, 404)
+      await app.close()
+    })
+  })
+
+  describe('GET /personas', () => {
+    it('lists available personas and default', async () => {
+      const { app } = await buildTestApp(null, {
+        personas:      { concise: { system: 'Be brief.' }, friendly: { system: 'Be warm.' } },
+        defaultPersona: 'concise',
+      })
+      const res  = await app.inject({ method: 'GET', url: '/personas' })
+      const body = JSON.parse(res.body)
+      assert.equal(res.statusCode, 200)
+      assert.ok(body.personas.includes('concise'))
+      assert.ok(body.personas.includes('friendly'))
+      assert.equal(body.default, 'concise')
+      await app.close()
+    })
+
+    it('GET /status includes personas list', async () => {
+      const { app } = await buildTestApp(null, {
+        personas: { concise: { system: 'Be brief.' } },
+      })
+      const res  = await app.inject({ method: 'GET', url: '/status' })
+      const body = JSON.parse(res.body)
+      assert.ok(Array.isArray(body.personas))
+      await app.close()
+    })
+  })
+
+  describe('persona resolution', () => {
+    it('POST /chat passes system prompt and options from named persona', async () => {
+      const ollama = makeOllama()
+      const { app } = await buildTestApp(ollama, {
+        personas: { concise: { system: 'Be brief.', options: { temperature: 0.3 } } },
+      })
+      await app.inject({
+        method: 'POST', url: '/chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hi', persona: 'concise' }),
+      })
+      assert.equal(ollama.calls[0].opts.system, 'Be brief.')
+      assert.deepEqual(ollama.calls[0].opts.options, { temperature: 0.3 })
+      await app.close()
+    })
+
+    it('POST /chat per-request options override persona options', async () => {
+      const ollama = makeOllama()
+      const { app } = await buildTestApp(ollama, {
+        personas: { concise: { system: 'Be brief.', options: { temperature: 0.3 } } },
+      })
+      await app.inject({
+        method: 'POST', url: '/chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hi', persona: 'concise', options: { temperature: 0.9 } }),
+      })
+      assert.deepEqual(ollama.calls[0].opts.options, { temperature: 0.9 })
+      await app.close()
+    })
+
+    it('POST /chat applies default persona when none specified', async () => {
+      const ollama = makeOllama()
+      const { app } = await buildTestApp(ollama, {
+        personas:      { mydefault: { system: 'Default system.' } },
+        defaultPersona: 'mydefault',
+      })
+      await app.inject({
+        method: 'POST', url: '/chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hi' }),
+      })
+      assert.equal(ollama.calls[0].opts.system, 'Default system.')
+      await app.close()
+    })
+
+    it('POST /chat returns 424 for unknown persona', async () => {
+      const { app } = await buildTestApp()
+      const res = await app.inject({
+        method: 'POST', url: '/chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hi', persona: 'no-such-persona' }),
+      })
+      assert.equal(res.statusCode, 424)
+      await app.close()
+    })
+
+    it('POST /context_chat uses persona system prompt', async () => {
+      const ollama = makeOllama()
+      const { app } = await buildTestApp(ollama, {
+        personas: { concise: { system: 'Be brief.' } },
+      })
+      await app.inject({
+        method: 'POST', url: '/context_chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hello', persona: 'concise' }),
+      })
+      assert.equal(ollama.calls[0].opts.system, 'Be brief.')
+      await app.close()
+    })
+
+    it('POST /context_chat returns 424 for unknown persona', async () => {
+      const { app } = await buildTestApp()
+      const res = await app.inject({
+        method: 'POST', url: '/context_chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hi', persona: 'ghost-persona' }),
+      })
+      assert.equal(res.statusCode, 424)
+      await app.close()
+    })
+
+    it('POST /context_chat resumes with session persona when none re-specified', async () => {
+      const ollama = makeOllama()
+      const { app } = await buildTestApp(ollama, {
+        personas: { concise: { system: 'Be brief.' } },
+      })
+
+      const r1  = await app.inject({
+        method: 'POST', url: '/context_chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Hello', persona: 'concise' }),
+      })
+      const { uid } = JSON.parse(r1.body)
+      assert.equal(ollama.calls[0].opts.system, 'Be brief.')
+
+      await app.inject({
+        method: 'POST', url: '/context_chat',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Continue', uid }),
+      })
+      assert.equal(ollama.calls[1].opts.system, 'Be brief.')
       await app.close()
     })
   })
