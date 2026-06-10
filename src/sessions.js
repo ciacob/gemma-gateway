@@ -3,22 +3,17 @@
 /**
  * Session store factory.
  *
- * Accepts injected dependencies for filesystem access and clock so that
- * tests can run without touching disk or real time.
- *
- * @param {Object}   deps
- * @param {Object}   [deps.fs]        fs-compatible interface (readFileSync etc.)
- * @param {Function} [deps.now]       Returns current timestamp ms (default: Date.now)
- * @param {Function} [deps.uuidFn]    Returns a new unique ID string
- * @param {string}   [deps.cacheDir]  Directory for session JSON files
- * @param {number}   [deps.modelContextTokens]
- * @param {number}   [deps.summarizeThresholdPct]
- * @param {number}   [deps.keepRecentTurns]
+ * Each session tracks:
+ *   - history      {Array}   Conversation turns
+ *   - cached       {boolean} Whether persisted to disk
+ *   - personaName  {string|null}
+ *   - images       {Array}   Verbalized images: [{ name, description }]
+ *   - imageMode    {string}  'on' | 'off'  — controls image-awareness injection
  */
 
-const nodefs          = require('fs')
-const nodepath        = require('path')
-const { randomUUID }  = require('crypto')
+const nodefs         = require('fs')
+const nodepath       = require('path')
+const { randomUUID } = require('crypto')
 
 const CHARS_PER_TOKEN = 4
 
@@ -35,8 +30,6 @@ function createSessionStore({
 } = {}) {
 
   const summarizeThresholdTokens = Math.floor(modelContextTokens * summarizeThresholdPct / 100)
-
-  // In-memory store: uid → session object
   const store = new Map()
 
   // -------------------------------------------------------------------------
@@ -47,10 +40,6 @@ function createSessionStore({
     return history.reduce((acc, turn) => acc + Math.ceil(turn.content.length / CHARS_PER_TOKEN), 0)
   }
 
-  /**
-   * Returns 0–100: percentage of the summarize threshold currently consumed.
-   * Resets to a lower value after summarisation fires.
-   */
   function contextUsagePct(history) {
     return Math.min(100, Math.round(estimateTokens(history) / summarizeThresholdTokens * 100))
   }
@@ -92,8 +81,8 @@ function createSessionStore({
   // -------------------------------------------------------------------------
 
   function buildSummaryPrompt(turnsToSummarise, existingSummary) {
-    const lines = turnsToSummarise.map(
-      t => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content}`
+    const lines      = turnsToSummarise.map(t =>
+      `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content}`
     )
     const transcript = lines.join('\n')
 
@@ -115,18 +104,6 @@ function createSessionStore({
     )
   }
 
-  /**
-   * Run tail summarisation on a history array.
-   *
-   * - role:'summary' turns are NEVER eligible for re-summarisation.
-   * - The most recent `keepRecentTurns` raw turns are kept verbatim.
-   * - Everything older is sent to the model and replaced by a single
-   *   role:'summary' turn at the head of the history.
-   *
-   * @param {Array}    history  Current full history
-   * @param {Function} chatFn   ollama.chat compatible function
-   * @returns {Array}  New history
-   */
   async function summarise(history, chatFn) {
     const existingSummary = history[0]?.role === 'summary' ? history[0] : null
     const rawTurns        = existingSummary ? history.slice(1) : history
@@ -144,12 +121,46 @@ function createSessionStore({
   }
 
   // -------------------------------------------------------------------------
+  // Image-awareness system prompt fragment
+  // -------------------------------------------------------------------------
+
+  /**
+   * Build the injected fragment that makes the model aware of verbalized images.
+   * Returns null when imageMode is 'off' or no images exist.
+   */
+  function buildImageFragment(session) {
+    if (session.imageMode === 'off') return null
+    if (!session.images || session.images.length === 0) return null
+
+    const list = session.images.map(img => `  - ${img.name}`).join('\n')
+
+    return (
+      `This conversation includes verbalized descriptions of the following image(s):\n` +
+      `${list}\n` +
+      `Their descriptions are available in the conversation history.\n` +
+      `If the user refers to an image but has not attached one to their current message, ` +
+      `acknowledge that you have the description and can work from it, but gently let them know ` +
+      `they can re-upload the image if they need you to examine it directly. ` +
+      `Do not repeatedly suggest re-uploading if the user seems satisfied working from the description.`
+    )
+  }
+
+  // -------------------------------------------------------------------------
   // Public API
   // -------------------------------------------------------------------------
 
   function create(cached = true, personaName = null) {
     const uid     = uuidFn()
-    const session = { uid, history: [], cached, personaName, createdAt: now(), updatedAt: now() }
+    const session = {
+      uid,
+      history:     [],
+      cached,
+      personaName,
+      images:      [],
+      imageMode:   'on',
+      createdAt:   now(),
+      updatedAt:   now(),
+    }
     store.set(uid, session)
     if (cached) writeToDisk(uid, session)
     return { uid, session }
@@ -159,6 +170,9 @@ function createSessionStore({
     if (store.has(uid)) return store.get(uid)
     const fromDisk = readFromDisk(uid)
     if (fromDisk) {
+      // Hydrate with defaults for fields added after initial creation
+      if (!fromDisk.images)    fromDisk.images    = []
+      if (!fromDisk.imageMode) fromDisk.imageMode = 'on'
       store.set(uid, fromDisk)
       return fromDisk
     }
@@ -183,6 +197,47 @@ function createSessionStore({
     return contextUsagePct(session.history)
   }
 
+  /**
+   * Register a verbalized image in the session.
+   * Automatically sets imageMode to 'on'.
+   *
+   * @param {string} uid
+   * @param {string} name         Original filename
+   * @param {string} description  Model-generated verbal description
+   */
+  function addImage(uid, name, description) {
+    const session = store.get(uid)
+    if (!session) throw new Error(`Session ${uid} not in memory`)
+
+    // Replace if same filename uploaded again
+    const existing = session.images.findIndex(img => img.name === name)
+    if (existing >= 0) {
+      session.images[existing] = { name, description }
+    } else {
+      session.images.push({ name, description })
+    }
+
+    session.imageMode = 'on'
+    session.updatedAt = now()
+
+    if (session.cached) writeToDisk(uid, session)
+  }
+
+  /**
+   * Set imageMode for a session ('on' or 'off').
+   * Automatically turns 'on' whenever an image is added via addImage().
+   */
+  function setImageMode(uid, mode) {
+    const session = store.get(uid)
+    if (!session) throw new Error(`Session ${uid} not in memory`)
+    if (mode !== 'on' && mode !== 'off') throw new Error(`imageMode must be 'on' or 'off'`)
+
+    session.imageMode = mode
+    session.updatedAt = now()
+
+    if (session.cached) writeToDisk(uid, session)
+  }
+
   function remove(uid) {
     const inMemory = store.has(uid)
     const onDisk   = fs.existsSync(sessionPath(uid))
@@ -203,6 +258,8 @@ function createSessionStore({
       turns:        session.history.filter(t => t.role !== 'summary').length,
       hasSummary:   session.history[0]?.role === 'summary',
       contextUsage: contextUsagePct(session.history),
+      images:       (session.images ?? []).map(img => img.name),
+      imageMode:    session.imageMode ?? 'on',
       createdAt:    session.createdAt,
       updatedAt:    session.updatedAt,
     }
@@ -212,8 +269,11 @@ function createSessionStore({
     create,
     resolve,
     appendAndMaybeCompress,
+    addImage,
+    setImageMode,
     remove,
     status,
+    buildImageFragment,
     // Exposed for testing
     estimateTokens,
     contextUsagePct,

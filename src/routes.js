@@ -9,7 +9,9 @@
  * @param {Object} deps
  * @param {Object} deps.ollamaClient     { chat, chatStream }
  * @param {Object} deps.modelManager    { ensureLoaded, touch, forceUnload, status }
- * @param {Object} deps.sessionStore    { create, resolve, appendAndMaybeCompress, remove, status }
+ * @param {Object} deps.sessionStore    { create, resolve, appendAndMaybeCompress,
+ *                                        addImage, setImageMode, remove, status,
+ *                                        buildImageFragment }
  * @param {Object} deps.queue           { enqueue, stats }
  * @param {Object} deps.personaManager  { load, list }
  * @param {string} [deps.defaultPersona]
@@ -22,20 +24,27 @@ function createRoutes({
   sessionStore,
   queue,
   personaManager,
-  defaultPersona  = process.env.DEFAULT_PERSONA ?? '',
-  maxUploadBytes  = parseInt(process.env.MAX_UPLOAD_BYTES ?? '52428800', 10),
+  defaultPersona = process.env.DEFAULT_PERSONA ?? '',
+  maxUploadBytes = parseInt(process.env.MAX_UPLOAD_BYTES ?? '52428800', 10),
 }) {
 
   // -------------------------------------------------------------------------
-  // Helper: resolve a persona name → { system?, options? }
-  // Returns {} when no persona is requested and no default is set.
-  // Throws {statusCode:424} when a named persona file is missing or invalid.
+  // Helper: resolve persona name → { system?, options? }
   // -------------------------------------------------------------------------
 
   function resolvePersona(requestedName) {
     const name = requestedName || defaultPersona || null
     if (!name) return {}
     return personaManager.load(name)
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper: build composite system prompt from persona + image fragment
+  // -------------------------------------------------------------------------
+
+  function buildSystemPrompt(personaSystem, imageFragment) {
+    const parts = [personaSystem, imageFragment].filter(Boolean)
+    return parts.length ? parts.join('\n\n') : undefined
   }
 
   // -------------------------------------------------------------------------
@@ -49,6 +58,57 @@ function createRoutes({
       modelManager.touch()
       return result
     })
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper: build image_context payload field from session
+  // -------------------------------------------------------------------------
+
+  function imageContext(session) {
+    const images = (session.images ?? []).map(img => img.name)
+    if (images.length === 0) return null
+    return {
+      mode:   session.imageMode ?? 'on',
+      images,
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper: parse multipart fields for context_chat
+  // Returns { prompt, uid, cache, personaName, reqOptions, imageBuffer,
+  //           imageName, imageMode }
+  // -------------------------------------------------------------------------
+
+  async function parseContextChatParts(req) {
+    const parts      = req.parts({ limits: { fileSize: maxUploadBytes } })
+    let prompt       = null
+    let uid          = null
+    let cache        = true
+    let personaName  = null
+    let reqOptions   = null
+    let imageBuffer  = null
+    let imageName    = null
+    let imageMode    = null   // 'on' | 'off' | null (no change)
+
+    for await (const part of parts) {
+      if (part.type === 'file' && part.fieldname === 'image') {
+        imageName       = part.filename ?? 'image'
+        const chunks    = []
+        for await (const chunk of part.file) chunks.push(chunk)
+        imageBuffer     = Buffer.concat(chunks)
+      } else if (part.type === 'field') {
+        if (part.fieldname === 'prompt')     prompt      = part.value
+        if (part.fieldname === 'uid')        uid         = part.value
+        if (part.fieldname === 'persona')    personaName = part.value
+        if (part.fieldname === 'image_mode') imageMode   = part.value   // 'on' or 'off'
+        if (part.fieldname === 'cache')      cache       = part.value !== 'false'
+        if (part.fieldname === 'options') {
+          try { reqOptions = JSON.parse(part.value) } catch { /* ignore */ }
+        }
+      }
+    }
+
+    return { prompt, uid, cache, personaName, reqOptions, imageBuffer, imageName, imageMode }
   }
 
   // -------------------------------------------------------------------------
@@ -75,7 +135,7 @@ function createRoutes({
     })
 
     // ------------------------------------------------------------------
-    // POST /chat
+    // POST /chat  (stateless)
     // ------------------------------------------------------------------
     app.post('/chat', {
       schema: {
@@ -94,19 +154,14 @@ function createRoutes({
       const { prompt, history, persona: personaName, options: reqOptions } = req.body
 
       let personaData
-      try {
-        personaData = resolvePersona(personaName)
-      } catch (err) {
-        return reply.status(err.statusCode ?? 424).send({ error: err.message })
-      }
+      try { personaData = resolvePersona(personaName) }
+      catch (err) { return reply.status(err.statusCode ?? 424).send({ error: err.message }) }
 
-      // Per-request options override persona options
       const options = reqOptions ?? personaData.options
 
       const reply_text = await run(() =>
         ollamaClient.chat({ text: prompt, history, system: personaData.system, options })
       )
-
       reply.send({ reply: reply_text })
     })
 
@@ -130,11 +185,8 @@ function createRoutes({
       const { prompt, history, persona: personaName, options: reqOptions } = req.body
 
       let personaData
-      try {
-        personaData = resolvePersona(personaName)
-      } catch (err) {
-        return reply.status(err.statusCode ?? 424).send({ error: err.message })
-      }
+      try { personaData = resolvePersona(personaName) }
+      catch (err) { return reply.status(err.statusCode ?? 424).send({ error: err.message }) }
 
       const options = reqOptions ?? personaData.options
 
@@ -144,7 +196,7 @@ function createRoutes({
 
       await run(async () => {
         for await (const token of ollamaClient.chatStream({
-          text: prompt, history, system: personaData.system, options
+          text: prompt, history, system: personaData.system, options,
         })) {
           reply.raw.write(`data: ${JSON.stringify({ token })}\n\n`)
         }
@@ -154,7 +206,7 @@ function createRoutes({
     })
 
     // ------------------------------------------------------------------
-    // POST /imagine
+    // POST /imagine  (stateless)
     // ------------------------------------------------------------------
     app.post('/imagine', async (req, reply) => {
       const parts = req.parts({ limits: { fileSize: maxUploadBytes } })
@@ -187,11 +239,8 @@ function createRoutes({
       }
 
       let personaData
-      try {
-        personaData = resolvePersona(personaName)
-      } catch (err) {
-        return reply.status(err.statusCode ?? 424).send({ error: err.message })
-      }
+      try { personaData = resolvePersona(personaName) }
+      catch (err) { return reply.status(err.statusCode ?? 424).send({ error: err.message }) }
 
       const options = reqOptions ?? personaData.options
 
@@ -202,7 +251,7 @@ function createRoutes({
     })
 
     // ------------------------------------------------------------------
-    // POST /transcribe
+    // POST /transcribe  (stateless)
     // ------------------------------------------------------------------
     app.post('/transcribe', async (req, reply) => {
       const parts = req.parts({ limits: { fileSize: maxUploadBytes } })
@@ -231,11 +280,8 @@ function createRoutes({
       }
 
       let personaData
-      try {
-        personaData = resolvePersona(personaName)
-      } catch (err) {
-        return reply.status(err.statusCode ?? 424).send({ error: err.message })
-      }
+      try { personaData = resolvePersona(personaName) }
+      catch (err) { return reply.status(err.statusCode ?? 424).send({ error: err.message }) }
 
       const options = reqOptions ?? personaData.options
 
@@ -246,33 +292,39 @@ function createRoutes({
     })
 
     // ------------------------------------------------------------------
-    // POST /context_chat
+    // POST /context_chat  (stateful, multipart)
+    //
+    // Multipart fields:
+    //   prompt      (required)  User message
+    //   uid         (optional)  Resume existing session
+    //   cache       (optional)  'true'|'false', default true
+    //   persona     (optional)  Persona name
+    //   options     (optional)  JSON object of inference params
+    //   image       (file, optional)  Triggers verbalization pipeline
+    //   image_mode  (optional)  'on'|'off' — toggle image-awareness
     // ------------------------------------------------------------------
-    app.post('/context_chat', {
-      schema: {
-        body: {
-          type: 'object',
-          required: ['prompt'],
-          properties: {
-            prompt:  { type: 'string', minLength: 1 },
-            uid:     { type: 'string' },
-            cache:   { type: 'boolean' },
-            persona: { type: 'string' },
-            options: { type: 'object' },
-          },
-        },
-      },
-    }, async (req, reply) => {
-      const { prompt, uid: incomingUid, cache = true, persona: personaName, options: reqOptions } = req.body
-
-      // Resolve persona before touching session state
-      let personaData
+    app.post('/context_chat', async (req, reply) => {
+      // Parse multipart (image is optional — text-only turns also go through here)
+      let fields
       try {
-        personaData = resolvePersona(personaName)
+        fields = await parseContextChatParts(req)
       } catch (err) {
-        return reply.status(err.statusCode ?? 424).send({ error: err.message })
+        return reply.status(400).send({ error: `Failed to parse request: ${err.message}` })
       }
 
+      const { prompt, uid: incomingUid, cache, personaName, reqOptions,
+              imageBuffer, imageName, imageMode } = fields
+
+      if (!prompt) {
+        return reply.status(400).send({ error: 'Missing required field: prompt' })
+      }
+
+      // Resolve persona
+      let personaData
+      try { personaData = resolvePersona(personaName) }
+      catch (err) { return reply.status(err.statusCode ?? 424).send({ error: err.message }) }
+
+      // Resolve session
       let session, uid, isNew = false, volatile = false
 
       if (incomingUid) {
@@ -285,7 +337,6 @@ function createRoutes({
         uid      = incomingUid
         volatile = !session.cached
       } else {
-        // Store persona name in session so it survives resume
         const created = sessionStore.create(cache, personaName || defaultPersona || null)
         uid      = created.uid
         session  = created.session
@@ -293,7 +344,12 @@ function createRoutes({
         volatile = !cache
       }
 
-      // On resume, use the persona the session was created with, unless overridden
+      // Apply explicit image_mode change if requested
+      if (imageMode === 'on' || imageMode === 'off') {
+        sessionStore.setImageMode(uid, imageMode)
+      }
+
+      // Resolve effective persona (session may carry one from creation)
       const effectivePersonaName = personaName
         || (incomingUid ? session.personaName : null)
         || defaultPersona
@@ -301,29 +357,83 @@ function createRoutes({
 
       let effectivePersona = personaData
       if (incomingUid && !personaName && effectivePersonaName) {
-        try {
-          effectivePersona = personaManager.load(effectivePersonaName)
-        } catch {
-          effectivePersona = {}
-        }
+        try { effectivePersona = personaManager.load(effectivePersonaName) }
+        catch { effectivePersona = {} }
       }
 
       const options = reqOptions ?? effectivePersona.options
 
+      // ------------------------------------------------------------------
+      // Image pipeline: verbalize on upload, then re-attach for direct vision
+      // ------------------------------------------------------------------
+
+      let imageAttachment  = null   // raw buffer for this turn (direct vision)
+      let verbalizationNote = null  // surface to caller when image was verbalized
+
+      if (imageBuffer) {
+        // Verbalize the image: ask the model to describe it richly
+        const verbPrompt = `Please describe this image in detail, as if explaining it to someone who cannot see it. Be thorough — note subjects, composition, colours, text if any, and any other notable elements.`
+
+        const description = await run(() =>
+          ollamaClient.chat({
+            text:    verbPrompt,
+            image:   imageBuffer,
+            history: [],
+            system:  effectivePersona.system,
+            options,
+          })
+        )
+
+        // Store description in session (also sets imageMode → 'on')
+        sessionStore.addImage(uid, imageName, description)
+
+        // Inject the description as an assistant turn so it's in history
+        const descriptionTurn = `[image: ${imageName}]\n${description}`
+        await sessionStore.appendAndMaybeCompress(
+          uid,
+          `[User uploaded image: ${imageName}]`,
+          descriptionTurn,
+          (opts) => ollamaClient.chat({ ...opts, system: effectivePersona.system })
+        )
+
+        // Also attach image to this turn so the model sees it directly
+        imageAttachment   = imageBuffer
+        verbalizationNote = imageName
+      }
+
+      // Build composite system prompt: persona + image-awareness fragment
+      const imageFragment = sessionStore.buildImageFragment(session)
+      const system        = buildSystemPrompt(effectivePersona.system, imageFragment)
+
+      // Run the actual user prompt
       const replyText = await run(() =>
         ollamaClient.chat({
           text:    prompt,
+          image:   imageAttachment,   // raw image attached only when uploaded this turn
           history: session.history,
-          system:  effectivePersona.system,
+          system,
           options,
         })
       )
 
       const contextUsage = await sessionStore.appendAndMaybeCompress(
-        uid, prompt, replyText, (opts) => ollamaClient.chat({ ...opts, system: effectivePersona.system })
+        uid, prompt, replyText,
+        (opts) => ollamaClient.chat({ ...opts, system })
       )
 
-      const response = { uid, reply: replyText, context_usage: contextUsage }
+      // Build response
+      const response = {
+        uid,
+        reply:         replyText,
+        context_usage: contextUsage,
+      }
+
+      const imgCtx = imageContext(session)
+      if (imgCtx) response.image_context = imgCtx
+
+      if (verbalizationNote) {
+        response.verbalized = verbalizationNote
+      }
 
       if (isNew && volatile) {
         response.notice = 'This is a volatile session — history is held in memory only and will be lost on server restart.'
@@ -357,7 +467,7 @@ function createRoutes({
     })
 
     // ------------------------------------------------------------------
-    // GET /personas — list available personas
+    // GET /personas
     // ------------------------------------------------------------------
     app.get('/personas', async () => ({
       personas: personaManager.list(),

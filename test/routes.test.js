@@ -90,6 +90,7 @@ async function buildTestApp(ollamaOverride, personaOpts = {}) {
   return { app, ollama, modelManager, sessionStore, personaManager }
 }
 
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -180,11 +181,8 @@ describe('routes', () => {
   describe('POST /context_chat', () => {
     it('creates a new session and returns uid + reply + context_usage', async () => {
       const { app } = await buildTestApp()
-      const res  = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi' }),
-      })
+      const { body: _b1, contentType: _ct1 } = buildMultipart({ prompt: 'Hi' })
+      const res  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _ct1 }, body: _b1 })
       const body = JSON.parse(res.body)
       assert.equal(res.statusCode, 200)
       assert.ok(body.uid)
@@ -195,11 +193,8 @@ describe('routes', () => {
 
     it('includes volatile notice when cache=false', async () => {
       const { app } = await buildTestApp()
-      const res  = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi', cache: false }),
-      })
+      const { body: _b2, contentType: _ct2 } = buildMultipart({ prompt: 'Hi', cache: 'false' })
+      const res  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _ct2 }, body: _b2 })
       const body = JSON.parse(res.body)
       assert.ok(body.notice?.includes('volatile'))
       await app.close()
@@ -207,11 +202,8 @@ describe('routes', () => {
 
     it('no volatile notice when cache=true', async () => {
       const { app } = await buildTestApp()
-      const res  = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi', cache: true }),
-      })
+      const { body: _b3, contentType: _ct3 } = buildMultipart({ prompt: 'Hi', cache: 'true' })
+      const res  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _ct3 }, body: _b3 })
       const body = JSON.parse(res.body)
       assert.equal(body.notice, undefined)
       await app.close()
@@ -219,18 +211,12 @@ describe('routes', () => {
 
     it('resumes an existing session by uid', async () => {
       const { app } = await buildTestApp()
-      const r1   = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'First' }),
-      })
+      const { body: _rb1, contentType: _rct1 } = buildMultipart({ prompt: 'First' })
+      const r1   = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _rct1 }, body: _rb1 })
       const { uid } = JSON.parse(r1.body)
 
-      const r2 = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Second', uid }),
-      })
+      const { body: _rb2, contentType: _rct2 } = buildMultipart({ prompt: 'Second', uid })
+      const r2 = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _rct2 }, body: _rb2 })
       assert.equal(r2.statusCode, 200)
       assert.equal(JSON.parse(r2.body).uid, uid)
       await app.close()
@@ -238,11 +224,8 @@ describe('routes', () => {
 
     it('returns 404 for unknown uid', async () => {
       const { app } = await buildTestApp()
-      const res = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi', uid: 'no-such-session' }),
-      })
+      const { body: _404b, contentType: _404ct } = buildMultipart({ prompt: 'Hi', uid: 'no-such-session' })
+      const res = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _404ct }, body: _404b })
       assert.equal(res.statusCode, 404)
       await app.close()
     })
@@ -251,11 +234,8 @@ describe('routes', () => {
   describe('DELETE /context_chat/:uid', () => {
     it('deletes a known session and returns deleted:true', async () => {
       const { app } = await buildTestApp()
-      const r1  = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi' }),
-      })
+      const { body: _db1, contentType: _dct1 } = buildMultipart({ prompt: 'Hi' })
+      const r1  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _dct1 }, body: _db1 })
       const { uid } = JSON.parse(r1.body)
 
       const res = await app.inject({ method: 'DELETE', url: `/context_chat/${uid}` })
@@ -275,11 +255,8 @@ describe('routes', () => {
   describe('GET /context_chat/:uid', () => {
     it('returns session status for known uid', async () => {
       const { app } = await buildTestApp()
-      const r1  = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi' }),
-      })
+      const { body: _gb1, contentType: _gct1 } = buildMultipart({ prompt: 'Hi' })
+      const r1  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _gct1 }, body: _gb1 })
       const { uid } = JSON.parse(r1.body)
 
       const res  = await app.inject({ method: 'GET', url: `/context_chat/${uid}` })
@@ -384,22 +361,16 @@ describe('routes', () => {
       const { app } = await buildTestApp(ollama, {
         personas: { concise: { system: 'Be brief.' } },
       })
-      await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hello', persona: 'concise' }),
-      })
+      const { body: _pb1, contentType: _pct1 } = buildMultipart({ prompt: 'Hello', persona: 'concise' })
+      await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _pct1 }, body: _pb1 })
       assert.equal(ollama.calls[0].opts.system, 'Be brief.')
       await app.close()
     })
 
     it('POST /context_chat returns 424 for unknown persona', async () => {
       const { app } = await buildTestApp()
-      const res = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hi', persona: 'ghost-persona' }),
-      })
+      const { body: _424b, contentType: _424ct } = buildMultipart({ prompt: 'Hi', persona: 'ghost-persona' })
+      const res = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _424ct }, body: _424b })
       assert.equal(res.statusCode, 424)
       await app.close()
     })
@@ -410,22 +381,182 @@ describe('routes', () => {
         personas: { concise: { system: 'Be brief.' } },
       })
 
-      const r1  = await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Hello', persona: 'concise' }),
-      })
+      const { body: _pr1b, contentType: _pr1ct } = buildMultipart({ prompt: 'Hello', persona: 'concise' })
+      const r1  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _pr1ct }, body: _pr1b })
       const { uid } = JSON.parse(r1.body)
       assert.equal(ollama.calls[0].opts.system, 'Be brief.')
 
-      await app.inject({
-        method: 'POST', url: '/context_chat',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Continue', uid }),
-      })
+      const { body: _pr2b, contentType: _pr2ct } = buildMultipart({ prompt: 'Continue', uid })
+      await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': _pr2ct }, body: _pr2b })
       assert.equal(ollama.calls[1].opts.system, 'Be brief.')
       await app.close()
     })
+  })
+
+})
+
+// ---------------------------------------------------------------------------
+// Multipart form builder — used by image context_chat tests
+// ---------------------------------------------------------------------------
+
+function buildMultipart(fields, file = null) {
+  const boundary = '----TestBoundary123'
+  const CRLF     = '\r\n'
+  const parts    = []
+
+  for (const [name, value] of Object.entries(fields)) {
+    parts.push(
+      `--${boundary}${CRLF}` +
+      `Content-Disposition: form-data; name="${name}"${CRLF}` +
+      `${CRLF}` +
+      `${value}`
+    )
+  }
+
+  if (file) {
+    const ct = file.contentType ?? 'image/jpeg'
+    parts.push(
+      `--${boundary}${CRLF}` +
+      `Content-Disposition: form-data; name="${file.fieldname}"; filename="${file.filename}"${CRLF}` +
+      `Content-Type: ${ct}${CRLF}` +
+      `${CRLF}` +
+      `${file.data}`
+    )
+  }
+
+  const body = parts.join(CRLF) + `${CRLF}--${boundary}--`
+  return { body, contentType: `multipart/form-data; boundary=${boundary}` }
+}
+
+// ---------------------------------------------------------------------------
+// Image context chat tests
+// ---------------------------------------------------------------------------
+
+describe('image context chat (POST /context_chat with image)', () => {
+
+  // Deterministic multi-call ollama mock
+  function makeMultiOllama(replies) {
+    let i = 0
+    return {
+      chat: async () => replies[i++] ?? 'fallback reply',
+      chatStream: async function* () {},
+      calls: [],
+    }
+  }
+
+  it('verbalizes uploaded image and returns verbalized field', async () => {
+    const ollama = makeMultiOllama(['A sunny beach with palm trees.', 'mock reply'])
+    const { app } = await buildTestApp(ollama)
+
+    const { body, contentType } = buildMultipart(
+      { prompt: 'What do you see?' },
+      { fieldname: 'image', filename: 'beach.jpg', data: 'fake-image-data' }
+    )
+
+    const res  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': contentType }, body })
+    const json = JSON.parse(res.body)
+    assert.equal(res.statusCode, 200)
+    assert.equal(json.verbalized, 'beach.jpg')
+    assert.ok(json.uid)
+    await app.close()
+  })
+
+  it('image_context in response includes mode and image name', async () => {
+    const ollama = makeMultiOllama(['A description.', 'reply'])
+    const { app } = await buildTestApp(ollama)
+
+    const { body, contentType } = buildMultipart(
+      { prompt: 'Describe it' },
+      { fieldname: 'image', filename: 'photo.png', data: 'fake' }
+    )
+
+    const res  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': contentType }, body })
+    const json = JSON.parse(res.body)
+    assert.ok(json.image_context)
+    assert.equal(json.image_context.mode, 'on')
+    assert.ok(json.image_context.images.includes('photo.png'))
+    await app.close()
+  })
+
+  it('subsequent text-only turn carries image_context', async () => {
+    const ollama = makeMultiOllama(['A description.', 'text reply', 'follow-up reply'])
+    const { app } = await buildTestApp(ollama)
+
+    const { body: b1, contentType: ct1 } = buildMultipart(
+      { prompt: 'Describe' },
+      { fieldname: 'image', filename: 'photo.jpg', data: 'fake' }
+    )
+    const r1  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': ct1 }, body: b1 })
+    const uid = JSON.parse(r1.body).uid
+
+    const { body: b2, contentType: ct2 } = buildMultipart({ prompt: 'What colour is it?', uid })
+    const r2   = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': ct2 }, body: b2 })
+    const json = JSON.parse(r2.body)
+    assert.ok(json.image_context)
+    assert.equal(json.image_context.mode, 'on')
+    await app.close()
+  })
+
+  it('image_context absent when no images in session', async () => {
+    const { app } = await buildTestApp()
+    const { body, contentType } = buildMultipart({ prompt: 'Hello' })
+    const res  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': contentType }, body })
+    const json = JSON.parse(res.body)
+    assert.equal(json.image_context, undefined)
+    await app.close()
+  })
+
+  it('image_mode off changes mode in response', async () => {
+    const ollama = makeMultiOllama(['A description.', 'reply', 'follow-up'])
+    const { app } = await buildTestApp(ollama)
+
+    const { body: b1, contentType: ct1 } = buildMultipart(
+      { prompt: 'Describe' },
+      { fieldname: 'image', filename: 'photo.jpg', data: 'fake' }
+    )
+    const r1  = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': ct1 }, body: b1 })
+    const uid = JSON.parse(r1.body).uid
+
+    const { body: b2, contentType: ct2 } = buildMultipart({ prompt: 'Never mind images', uid, image_mode: 'off' })
+    const r2   = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': ct2 }, body: b2 })
+    const json = JSON.parse(r2.body)
+    assert.equal(json.image_context.mode, 'off')
+    await app.close()
+  })
+
+  it('re-uploading same filename replaces the image entry', async () => {
+    let callCount = 0
+    const ollama = {
+      chat: async (opts) => { callCount++; return opts.image ? `Desc ${callCount}` : 'reply' },
+      chatStream: async function* () {},
+      calls: [],
+    }
+    const { app, sessionStore } = await buildTestApp(ollama)
+
+    const upload = async (prompt, uid) => {
+      const fields = uid ? { prompt, uid } : { prompt }
+      const { body, contentType } = buildMultipart(
+        fields,
+        { fieldname: 'image', filename: 'photo.jpg', data: 'fake' }
+      )
+      return app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': contentType }, body })
+    }
+
+    const r1  = await upload('First upload')
+    const uid = JSON.parse(r1.body).uid
+    await upload('Re-upload', uid)
+
+    const session = sessionStore.resolve(uid)
+    assert.equal(session.images.length, 1)   // replaced, not duplicated
+    await app.close()
+  })
+
+  it('returns 400 when prompt field is missing', async () => {
+    const { app } = await buildTestApp()
+    const { body, contentType } = buildMultipart({ uid: 'some-uid' })  // no prompt
+    const res = await app.inject({ method: 'POST', url: '/context_chat', headers: { 'content-type': contentType }, body })
+    assert.equal(res.statusCode, 400)
+    await app.close()
   })
 
 })

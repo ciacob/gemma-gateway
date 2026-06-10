@@ -335,4 +335,173 @@ describe('sessions', () => {
     })
   })
 
+
+  describe('image tracking', () => {
+
+    describe('addImage', () => {
+      it('adds an image to the session', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'A sunny beach scene.')
+        assert.equal(session.images.length, 1)
+        assert.equal(session.images[0].name, 'photo.jpg')
+        assert.equal(session.images[0].description, 'A sunny beach scene.')
+      })
+
+      it('automatically sets imageMode to on', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.setImageMode(uid, 'off')
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        assert.equal(session.imageMode, 'on')
+      })
+
+      it('replaces existing entry when same filename re-uploaded', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'Original description.')
+        store.addImage(uid, 'photo.jpg', 'Updated description.')
+        assert.equal(session.images.length, 1)
+        assert.equal(session.images[0].description, 'Updated description.')
+      })
+
+      it('tracks multiple distinct images', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'a.jpg', 'Image A.')
+        store.addImage(uid, 'b.jpg', 'Image B.')
+        assert.equal(session.images.length, 2)
+      })
+
+      it('throws when uid not in memory', () => {
+        const store = makeStore()
+        assert.throws(
+          () => store.addImage('ghost', 'x.jpg', 'desc'),
+          /not in memory/
+        )
+      })
+
+      it('persists to disk when session is cached', () => {
+        const fakeFs = makeFakeFs()
+        const store  = createSessionStore({ fs: fakeFs, cacheDir: '/fake/sessions' })
+        const { uid } = store.create(true)
+        fakeFs._files.clear()
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        assert.equal(fakeFs._files.size, 1)
+      })
+    })
+
+    describe('setImageMode', () => {
+      it('sets imageMode to off', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        store.setImageMode(uid, 'off')
+        assert.equal(session.imageMode, 'off')
+      })
+
+      it('sets imageMode back to on', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.setImageMode(uid, 'off')
+        store.setImageMode(uid, 'on')
+        assert.equal(session.imageMode, 'on')
+      })
+
+      it('throws for invalid mode value', () => {
+        const store = makeStore()
+        const { uid } = store.create(false)
+        assert.throws(
+          () => store.setImageMode(uid, 'maybe'),
+          /must be 'on' or 'off'/
+        )
+      })
+
+      it('throws when uid not in memory', () => {
+        const store = makeStore()
+        assert.throws(
+          () => store.setImageMode('ghost', 'off'),
+          /not in memory/
+        )
+      })
+    })
+
+    describe('buildImageFragment', () => {
+      it('returns null when no images in session', () => {
+        const store = makeStore()
+        const { session } = store.create(false)
+        assert.equal(store.buildImageFragment(session), null)
+      })
+
+      it('returns null when imageMode is off', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        store.setImageMode(uid, 'off')
+        assert.equal(store.buildImageFragment(session), null)
+      })
+
+      it('returns fragment mentioning image filename when imageMode is on', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        const fragment = store.buildImageFragment(session)
+        assert.ok(fragment !== null)
+        assert.ok(fragment.includes('photo.jpg'))
+      })
+
+      it('mentions all image filenames', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'a.jpg', 'Image A.')
+        store.addImage(uid, 'b.jpg', 'Image B.')
+        const fragment = store.buildImageFragment(session)
+        assert.ok(fragment.includes('a.jpg'))
+        assert.ok(fragment.includes('b.jpg'))
+      })
+
+      it('fragment instructs model to offer re-upload', () => {
+        const store = makeStore()
+        const { uid, session } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        const fragment = store.buildImageFragment(session)
+        assert.ok(fragment.includes('re-upload'))
+      })
+    })
+
+    describe('status with images', () => {
+      it('includes image names and imageMode in status snapshot', () => {
+        const store = makeStore()
+        const { uid } = store.create(false)
+        store.addImage(uid, 'photo.jpg', 'A beach.')
+        const s = store.status(uid)
+        assert.deepEqual(s.images, ['photo.jpg'])
+        assert.equal(s.imageMode, 'on')
+      })
+
+      it('returns empty images array when no images added', () => {
+        const store = makeStore()
+        const { uid } = store.create(false)
+        const s = store.status(uid)
+        assert.deepEqual(s.images, [])
+      })
+    })
+
+    describe('resolve hydration', () => {
+      it('adds default images and imageMode when hydrating old session from disk', () => {
+        // Simulate a session file created before image support was added
+        const fakeFs = makeFakeFs()
+        const uid    = 'legacy-uid'
+        const legacy = { uid, history: [], cached: true, createdAt: 1, updatedAt: 1 }
+        fakeFs._files.set(`/fake/sessions/${uid}.json`, JSON.stringify(legacy))
+
+        const store   = createSessionStore({ fs: fakeFs, cacheDir: '/fake/sessions' })
+        const session = store.resolve(uid)
+        assert.deepEqual(session.images,    [])
+        assert.equal(session.imageMode, 'on')
+      })
+    })
+
+  })
+
 })
