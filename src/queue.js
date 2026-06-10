@@ -1,43 +1,50 @@
 'use strict'
 
 /**
- * Thin wrapper around p-queue.
+ * Queue factory.
  *
- * - Concurrency = 1 by default (Ollama handles one inference at a time well)
- * - Hard cap on pending size → 429 instead of unbounded memory growth
- * - Exposes queue depth for health/status endpoints
+ * Returns a { enqueue, stats } pair backed by a p-queue instance.
+ * Accepting config as arguments (rather than reading process.env at module
+ * load time) means tests can create isolated queues with known settings.
+ *
+ * The module-level export is the singleton used by the running server,
+ * configured from process.env. Tests instantiate via createQueue() directly.
  */
 
 const { default: PQueue } = require('p-queue')
 
-const CONCURRENCY = parseInt(process.env.QUEUE_CONCURRENCY ?? '1',  10)
-const MAX_SIZE    = parseInt(process.env.QUEUE_MAX_SIZE    ?? '20', 10)
+function createQueue({
+  concurrency = parseInt(process.env.QUEUE_CONCURRENCY ?? '1',  10),
+  maxSize     = parseInt(process.env.QUEUE_MAX_SIZE    ?? '20', 10),
+} = {}) {
+  const queue = new PQueue({ concurrency })
 
-const queue = new PQueue({ concurrency: CONCURRENCY })
-
-/**
- * Enqueue a task function.
- * Throws a {status: 429} error if the queue is at capacity.
- *
- * @param  {Function} fn   Async function to run
- * @returns {Promise}      Resolves/rejects with fn's result
- */
-function enqueue(fn) {
-  if (queue.size >= MAX_SIZE) {
-    const err = new Error(`Queue full (${MAX_SIZE} pending). Try again later.`)
-    err.statusCode = 429
-    throw err
+  /**
+   * Enqueue a task function.
+   * Throws a {statusCode: 429} error if the queue is at capacity.
+   */
+  function enqueue(fn) {
+    if (queue.size >= maxSize) {
+      const err = new Error(`Queue full (${maxSize} pending). Try again later.`)
+      err.statusCode = 429
+      throw err
+    }
+    return queue.add(fn)
   }
-  return queue.add(fn)
+
+  function stats() {
+    return {
+      pending:     queue.size,
+      running:     queue.pending,
+      concurrency,
+      maxSize,
+    }
+  }
+
+  return { enqueue, stats }
 }
 
-function stats() {
-  return {
-    pending:     queue.size,
-    running:     queue.pending,
-    concurrency: CONCURRENCY,
-    maxSize:     MAX_SIZE,
-  }
-}
+// Singleton for production use
+const defaultQueue = createQueue()
 
-module.exports = { enqueue, stats }
+module.exports = { createQueue, ...defaultQueue }

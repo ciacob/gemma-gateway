@@ -1,23 +1,19 @@
 'use strict'
 
 /**
- * ModelManager
+ * ModelManager class.
  *
- * Owns the model's lifecycle:
- *   - UNLOADED  → LOADING → READY → UNLOADING → UNLOADED
+ * Owns the model lifecycle: UNLOADED → LOADING → READY → UNLOADING → UNLOADED
  *
- * On the first request it boots the model, resets an idle timer on every
- * request, and unloads the model when the idle TTL expires with no activity.
+ * Dependencies are injected so tests can:
+ *   - Supply a mock ollamaClient without network calls
+ *   - Supply fake timer functions to control idle TTL without real waits
  *
- * The Ollama keep_alive parameter acts as a safety net inside Ollama itself;
- * the idle timer here lets us unload proactively and emit events so the rest
- * of the app can react (e.g. log, metric, refuse queued work).
+ * The module exports a singleton instance for production use, and the class
+ * itself for test instantiation.
  */
 
 const EventEmitter = require('events')
-const ollama       = require('./ollama')
-
-const IDLE_TTL_MS = parseInt(process.env.IDLE_TTL_SECONDS ?? '360', 10) * 1000
 
 const STATE = Object.freeze({
   UNLOADED:  'unloaded',
@@ -27,14 +23,34 @@ const STATE = Object.freeze({
 })
 
 class ModelManager extends EventEmitter {
-  constructor() {
+  /**
+   * @param {Object}   opts
+   * @param {Object}   opts.ollamaClient        Must expose loadModel() and unloadModel()
+   * @param {number}   [opts.idleTtlMs]         Idle timeout in milliseconds
+   * @param {Function} [opts.setTimeoutFn]      Injected setTimeout (default: global)
+   * @param {Function} [opts.clearTimeoutFn]    Injected clearTimeout (default: global)
+   */
+  constructor({
+    ollamaClient,
+    idleTtlMs      = parseInt(process.env.IDLE_TTL_SECONDS ?? '360', 10) * 1000,
+    setTimeoutFn   = setTimeout,
+    clearTimeoutFn = clearTimeout,
+  }) {
     super()
-    this._state     = STATE.UNLOADED
-    this._idleTimer = null
-    this._loadPromise = null
+    this._ollama        = ollamaClient
+    this._idleTtlMs     = idleTtlMs
+    this._setTimeout    = setTimeoutFn
+    this._clearTimeout  = clearTimeoutFn
+    this._state         = STATE.UNLOADED
+    this._idleTimer     = null
+    this._loadPromise   = null
   }
 
-  get state() { return this._state }
+  // -------------------------------------------------------------------------
+  // Accessors
+  // -------------------------------------------------------------------------
+
+  get state()   { return this._state }
   get isReady() { return this._state === STATE.READY }
 
   // -------------------------------------------------------------------------
@@ -42,8 +58,8 @@ class ModelManager extends EventEmitter {
   // -------------------------------------------------------------------------
 
   /**
-   * Ensure the model is loaded. Returns a promise that resolves when READY.
-   * Safe to call concurrently — multiple callers share the same load promise.
+   * Ensure the model is loaded. Safe to call concurrently — multiple callers
+   * share the same load promise rather than triggering duplicate loads.
    */
   async ensureLoaded() {
     if (this._state === STATE.READY) {
@@ -56,7 +72,6 @@ class ModelManager extends EventEmitter {
     }
 
     if (this._state === STATE.UNLOADING) {
-      // Wait for unload to finish, then reload
       await new Promise(resolve => this.once('unloaded', resolve))
     }
 
@@ -65,28 +80,24 @@ class ModelManager extends EventEmitter {
     return this._loadPromise
   }
 
-  /**
-   * Touch the idle timer — call this after every successful request.
-   */
+  /** Reset the idle timer — call after every successful inference. */
   touch() {
     if (this._state === STATE.READY) this._resetIdleTimer()
   }
 
-  /**
-   * Manually unload the model (e.g. admin endpoint or graceful shutdown).
-   */
+  /** Manually unload the model (admin endpoint or graceful shutdown). */
   async forceUnload() {
     if (this._state === STATE.UNLOADED || this._state === STATE.UNLOADING) return
     this._clearIdleTimer()
     await this._doUnload()
   }
 
-  /** Human-readable status snapshot */
+  /** Lightweight status snapshot. */
   status() {
     return {
-      state:          this._state,
-      model:          process.env.OLLAMA_MODEL ?? 'gemma4:e4b',
-      idleTtlSeconds: IDLE_TTL_MS / 1000,
+      state:           this._state,
+      model:           process.env.OLLAMA_MODEL ?? 'gemma4:e4b',
+      idleTtlSeconds:  this._idleTtlMs / 1000,
       idleTimerActive: this._idleTimer !== null,
     }
   }
@@ -97,17 +108,14 @@ class ModelManager extends EventEmitter {
 
   async _doLoad() {
     this.emit('loading')
-    console.log('[ModelManager] loading model…')
     try {
-      await ollama.loadModel()
+      await this._ollama.loadModel()
       this._state = STATE.READY
       this._resetIdleTimer()
       this.emit('ready')
-      console.log('[ModelManager] model ready')
     } catch (err) {
       this._state = STATE.UNLOADED
       this.emit('error', err)
-      console.error('[ModelManager] load failed:', err.message)
       throw err
     } finally {
       this._loadPromise = null
@@ -117,36 +125,54 @@ class ModelManager extends EventEmitter {
   async _doUnload() {
     this._state = STATE.UNLOADING
     this.emit('unloading')
-    console.log('[ModelManager] unloading model…')
     try {
-      await ollama.unloadModel()
+      await this._ollama.unloadModel()
     } catch (err) {
-      console.warn('[ModelManager] unload warning:', err.message)
-      // Non-fatal — model will time out on Ollama side anyway
+      // Non-fatal — Ollama will time out on its own
     }
     this._state = STATE.UNLOADED
     this.emit('unloaded')
-    console.log('[ModelManager] model unloaded')
   }
 
   _resetIdleTimer() {
     this._clearIdleTimer()
-    this._idleTimer = setTimeout(async () => {
+    this._idleTimer = this._setTimeout(async () => {
       this._idleTimer = null
-      console.log('[ModelManager] idle TTL expired, unloading…')
       await this._doUnload()
-    }, IDLE_TTL_MS)
-    // Don't prevent process exit
-    if (this._idleTimer.unref) this._idleTimer.unref()
+    }, this._idleTtlMs)
+    if (this._idleTimer?.unref) this._idleTimer.unref()
   }
 
   _clearIdleTimer() {
-    if (this._idleTimer) {
-      clearTimeout(this._idleTimer)
+    if (this._idleTimer !== null) {
+      this._clearTimeout(this._idleTimer)
       this._idleTimer = null
     }
   }
 }
 
-// Singleton — one manager per process
-module.exports = new ModelManager()
+// ---------------------------------------------------------------------------
+// Singleton for production use
+// ---------------------------------------------------------------------------
+
+// Defer require to avoid circular dependency issues at module load time
+let _defaultInstance = null
+function getDefaultInstance() {
+  if (!_defaultInstance) {
+    const ollama = require('./ollama')
+    _defaultInstance = new ModelManager({ ollamaClient: ollama })
+  }
+  return _defaultInstance
+}
+
+// Proxy object so callers can do `require('./modelManager').ensureLoaded()` etc.
+module.exports = new Proxy({}, {
+  get(_, prop) {
+    if (prop === 'ModelManager') return ModelManager
+    const instance = getDefaultInstance()
+    const val = instance[prop]
+    return typeof val === 'function' ? val.bind(instance) : val
+  }
+})
+
+module.exports.ModelManager = ModelManager

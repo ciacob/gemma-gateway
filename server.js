@@ -2,48 +2,61 @@
 
 require('dotenv').config()
 
-const Fastify    = require('fastify')
-const multipart  = require('@fastify/multipart')
-const routes     = require('./src/routes')
-const modelManager = require('./src/modelManager')
+const Fastify   = require('fastify')
+const multipart = require('@fastify/multipart')
+
+const { createOllamaClient }  = require('./src/ollama')
+const { ModelManager }        = require('./src/modelManager')
+const { createQueue }         = require('./src/queue')
+const { createSessionStore }  = require('./src/sessions')
+const { createRoutes }        = require('./src/routes')
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10)
 const HOST = process.env.HOST ?? '127.0.0.1'
 
 // ---------------------------------------------------------------------------
-// Build app
+// buildApp — exported so integration tests can spin up the full stack
+// without calling listen()
 // ---------------------------------------------------------------------------
 
-const app = Fastify({
-  logger: {
-    transport: {
-      target: 'pino-pretty',
-      options: { colorize: true, translateTime: 'HH:MM:ss' },
+function buildApp() {
+  const ollamaClient  = createOllamaClient()
+  const modelManager  = new ModelManager({ ollamaClient })
+  const queue         = createQueue()
+  const sessionStore  = createSessionStore()
+
+  const app = Fastify({
+    logger: {
+      transport: {
+        target:  'pino-pretty',
+        options: { colorize: true, translateTime: 'HH:MM:ss' },
+      },
     },
-  },
-})
+  })
 
-app.register(multipart)
-app.register(routes)
+  app.register(multipart)
+  app.register(createRoutes({ ollamaClient, modelManager, sessionStore, queue }))
 
-// ---------------------------------------------------------------------------
-// Error handler
-// ---------------------------------------------------------------------------
+  app.setErrorHandler((err, req, reply) => {
+    const status = err.statusCode ?? err.status ?? 500
+    app.log.error({ err }, err.message)
+    reply.status(status).send({ error: err.message })
+  })
 
-app.setErrorHandler((err, req, reply) => {
-  const status = err.statusCode ?? err.status ?? 500
-  app.log.error({ err }, err.message)
-  reply.status(status).send({ error: err.message })
-})
+  // Expose for graceful shutdown
+  app.modelManager = modelManager
+
+  return app
+}
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 
-async function shutdown(signal) {
+async function shutdown(app, signal) {
   app.log.info(`${signal} received — shutting down`)
   try {
-    await modelManager.forceUnload()
+    await app.modelManager.forceUnload()
   } catch (e) {
     app.log.warn('Could not unload model during shutdown:', e.message)
   }
@@ -51,16 +64,22 @@ async function shutdown(signal) {
   process.exit(0)
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'))
-process.on('SIGINT',  () => shutdown('SIGINT'))
-
 // ---------------------------------------------------------------------------
-// Start
+// Entry point
 // ---------------------------------------------------------------------------
 
-app.listen({ port: PORT, host: HOST }, (err) => {
-  if (err) {
-    app.log.error(err)
-    process.exit(1)
-  }
-})
+if (require.main === module) {
+  const app = buildApp()
+
+  process.on('SIGTERM', () => shutdown(app, 'SIGTERM'))
+  process.on('SIGINT',  () => shutdown(app, 'SIGINT'))
+
+  app.listen({ port: PORT, host: HOST }, (err) => {
+    if (err) {
+      app.log.error(err)
+      process.exit(1)
+    }
+  })
+}
+
+module.exports = { buildApp }
