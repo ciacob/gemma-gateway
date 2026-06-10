@@ -7,7 +7,8 @@ concurrency limit queue up instead of choking Ollama.
 
 Stateful conversation is supported via `/context_chat`, which manages session
 history automatically — including transparent compression via summarisation when
-the context window fills up.
+the context window fills up, multi-turn image context via verbalization, and
+per-session persona assignment.
 
 ---
 
@@ -29,17 +30,19 @@ cp .env .env.local   # tweak if needed
 
 Key `.env` knobs:
 
-| Variable                         | Default    | Meaning                                                        |
-|----------------------------------|------------|----------------------------------------------------------------|
-| `OLLAMA_MODEL`                   | gemma4:e4b | Which model tag to use                                         |
-| `MODEL_KEEP_ALIVE_SECONDS`       | 300        | Ollama keeps model in VRAM for this long                       |
-| `IDLE_TTL_SECONDS`               | 360        | Server unloads model after this much inactivity                |
-| `QUEUE_CONCURRENCY`              | 1          | Parallel requests sent to Ollama                               |
-| `QUEUE_MAX_SIZE`                 | 20         | Max queued requests before 429                                 |
-| `SESSION_CACHE_DIR`              | sessions/  | Directory where cached session files are stored                |
-| `MODEL_CONTEXT_TOKENS`           | 131072     | Model context window size in tokens (128K for gemma4:e4b)      |
-| `CONTEXT_SUMMARIZE_THRESHOLD`    | 70         | % of context window that triggers history summarisation        |
-| `CONTEXT_SUMMARY_KEEP_RECENT`    | 10         | Recent raw turns kept verbatim during summarisation            |
+| Variable                      | Default    | Meaning                                                   |
+|-------------------------------|------------|-----------------------------------------------------------|
+| `OLLAMA_MODEL`                | gemma4:e4b | Which model tag to use                                    |
+| `MODEL_KEEP_ALIVE_SECONDS`    | 300        | Ollama keeps model in VRAM for this long                  |
+| `IDLE_TTL_SECONDS`            | 360        | Server unloads model after this much inactivity           |
+| `QUEUE_CONCURRENCY`           | 1          | Parallel requests sent to Ollama                          |
+| `QUEUE_MAX_SIZE`              | 20         | Max queued requests before 429                            |
+| `SESSION_CACHE_DIR`           | sessions/  | Directory where cached session files are stored           |
+| `MODEL_CONTEXT_TOKENS`        | 131072     | Model context window in tokens (128K for gemma4:e4b)      |
+| `CONTEXT_SUMMARIZE_THRESHOLD` | 70         | % of context window that triggers history summarisation   |
+| `CONTEXT_SUMMARY_KEEP_RECENT` | 10         | Recent raw turns kept verbatim during summarisation       |
+| `PERSONAS_DIR`                | personas/  | Directory containing persona JSON files                   |
+| `DEFAULT_PERSONA`             | default    | Persona used when none is specified in the request        |
 
 ---
 
@@ -76,12 +79,13 @@ pm2 startup                # follow the printed instruction
 
 ### GET /status
 ```bash
-curl http://localhost:3000/status
+curl http://localhost:3000/status | jq
 ```
 ```json
 {
-  "model": { "state": "ready", "idleTtlSeconds": 360, "idleTimerActive": true },
-  "queue": { "pending": 0, "running": 1, "concurrency": 1, "maxSize": 20 }
+  "model":    { "state": "ready", "idleTtlSeconds": 360, "idleTimerActive": true },
+  "queue":    { "pending": 0, "running": 1, "concurrency": 1, "maxSize": 20 },
+  "personas": ["concise", "default", "friendly"]
 }
 ```
 
@@ -95,20 +99,19 @@ For automatic context management use `/context_chat` instead.
 ```bash
 curl http://localhost:3000/chat \
   -H 'Content-Type: application/json' \
-  -d '{"prompt": "Explain the difference between TCP and UDP in two sentences."}'
+  -d '{"prompt": "Explain the difference between TCP and UDP in two sentences."}' \
+  | jq '.reply'
 ```
 
-With conversation history:
+With a persona and inference options:
 ```bash
 curl http://localhost:3000/chat \
   -H 'Content-Type: application/json' \
   -d '{
-    "prompt": "What did I just ask you?",
-    "history": [
-      {"role": "user",      "content": "Explain TCP vs UDP."},
-      {"role": "assistant", "content": "TCP is reliable and ordered..."}
-    ]
-  }'
+    "prompt":  "Explain recursion.",
+    "persona": "concise",
+    "options": { "temperature": 0.4 }
+  }' | jq '.reply'
 ```
 
 ---
@@ -124,14 +127,16 @@ Final event: `data: [DONE]`
 
 ---
 
-### POST /imagine — image understanding
+### POST /imagine — stateless image understanding
 ```bash
 curl http://localhost:3000/imagine \
   -F 'image=@/path/to/photo.jpg' \
-  -F 'prompt=What objects are visible in this image?'
+  -F 'prompt=What objects are visible in this image?' \
+  | jq '.reply'
 ```
 
-Default prompt (omit `-F prompt`) is `"Describe this image."`
+Default prompt (omit `-F prompt`) is `"Describe this image."` Optionally pass
+`-F 'persona=concise'` to control tone.
 
 ---
 
@@ -139,7 +144,8 @@ Default prompt (omit `-F prompt`) is `"Describe this image."`
 ```bash
 curl http://localhost:3000/transcribe \
   -F 'audio=@/path/to/recording.wav' \
-  -F 'prompt=Transcribe this audio accurately.'
+  -F 'prompt=Transcribe this audio accurately.' \
+  | jq '.reply'
 ```
 
 Supported formats: WAV, MP3, FLAC, OGG.
@@ -154,79 +160,118 @@ Useful before a long idle period to free memory.
 
 ---
 
-### POST /context_chat — stateful chat with automatic context management
+### GET /personas — list available personas
+```bash
+curl http://localhost:3000/personas | jq
+```
+```json
+{ "personas": ["concise", "default", "friendly"], "default": "default" }
+```
 
-Maintains conversation history server-side. On first call a session is created
-and a `uid` returned; subsequent calls pass that `uid` to resume the conversation.
+---
+
+### POST /context_chat — stateful chat
+
+Maintains conversation history server-side. Always use multipart form data,
+even for text-only turns. On first call a session is created and a `uid`
+returned; subsequent calls pass that `uid` to resume.
+
 History is persisted to disk by default so sessions survive server restarts.
+When history fills the context window, the oldest turns are compressed inline
+via summarisation. Images uploaded during a session are verbalized on first
+upload and their descriptions carried in history for subsequent turns.
 
-When accumulated history approaches the model's context window, the oldest turns
-are automatically summarised inline by the model itself and replaced by a single
-compressed turn. The response always includes a `context_usage` percentage so
-callers can monitor memory pressure.
-
-**Create a new session (cached to disk by default):**
+**New session — text only:**
 ```bash
 curl http://localhost:3000/context_chat \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt": "My name is Alex and I am debugging a Rust async runtime."}'
+  -F 'prompt=My name is Alex and I am debugging a Rust async runtime.' \
+  | jq
 ```
 ```json
 {
-  "uid": "3f2a1b...",
-  "reply": "Hello Alex! What aspect of the async runtime are you looking into?",
+  "uid":           "3f2a1b...",
+  "reply":         "Hello Alex! What aspect of the async runtime are you looking into?",
   "context_usage": 2
 }
 ```
 
-**Resume the session:**
+**Resume a session:**
 ```bash
 curl http://localhost:3000/context_chat \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt": "What is my name?", "uid": "3f2a1b..."}'
+  -F 'prompt=What is my name?' \
+  -F 'uid=3f2a1b...' \
+  | jq '.reply'
 ```
 
-**Create a volatile session (in-memory only, lost on restart):**
+**New volatile session (in-memory only, lost on restart):**
 ```bash
 curl http://localhost:3000/context_chat \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt": "Hello", "cache": false}'
+  -F 'prompt=Hello' \
+  -F 'cache=false' \
+  | jq
 ```
 A `notice` field in the response confirms the session is volatile.
 
+**With a persona:**
+```bash
+curl http://localhost:3000/context_chat \
+  -F 'prompt=Explain async/await in Rust.' \
+  -F 'persona=concise' \
+  | jq '.reply'
+```
+
 **Request fields:**
 
-| Field    | Type    | Required | Default | Description                                   |
-|----------|---------|----------|---------|-----------------------------------------------|
-| `prompt` | string  | yes      | —       | The user's message                            |
-| `uid`    | string  | no       | —       | Session ID to resume; 404 if not found        |
-| `cache`  | boolean | no       | `true`  | Persist session to disk                       |
+| Field        | Type    | Required | Default | Description                                       |
+|--------------|---------|----------|---------|---------------------------------------------------|
+| `prompt`     | string  | yes      | —       | The user's message                                |
+| `uid`        | string  | no       | —       | Session ID to resume; 404 if not found            |
+| `cache`      | string  | no       | `true`  | `'true'` or `'false'` — persist session to disk   |
+| `persona`    | string  | no       | —       | Persona name; 424 if file not found               |
+| `options`    | string  | no       | —       | JSON-encoded inference params, e.g. `'{"temperature":0.3}'` |
+| `image`      | file    | no       | —       | Triggers image verbalization pipeline             |
+| `image_mode` | string  | no       | —       | `'on'` or `'off'` — toggle image-awareness        |
 
 **Response fields:**
 
-| Field           | Type   | Description                                              |
-|-----------------|--------|----------------------------------------------------------|
-| `uid`           | string | Session ID (pass this back to continue the conversation) |
-| `reply`         | string | The model's response                                     |
-| `context_usage` | number | 0–100% of the summarisation threshold consumed           |
-| `notice`        | string | Present only on new volatile sessions                    |
+| Field           | Type   | Description                                                  |
+|-----------------|--------|--------------------------------------------------------------|
+| `uid`           | string | Session ID — pass back on every subsequent turn              |
+| `reply`         | string | The model's response                                         |
+| `context_usage` | number | 0–100% of the summarisation threshold consumed               |
+| `image_context` | object | Present when session has verbalized images (see below)       |
+| `verbalized`    | string | Filename of the image just verbalized, when an image was uploaded this turn |
+| `notice`        | string | Present only on new volatile sessions                        |
+
+**`image_context` shape:**
+```json
+{
+  "mode":   "on",
+  "images": ["photo.jpg", "diagram.png"]
+}
+```
+`mode: "on"` means the model is aware of the verbalized images and will offer to
+re-examine them if it detects a reference without a fresh upload. `mode: "off"`
+suppresses that behaviour while keeping the descriptions available in history.
 
 ---
 
 ### GET /context_chat/:uid — inspect session
 
 ```bash
-curl http://localhost:3000/context_chat/3f2a1b...
+curl http://localhost:3000/context_chat/3f2a1b... | jq
 ```
 ```json
 {
-  "uid": "3f2a1b...",
-  "cached": true,
-  "turns": 6,
-  "hasSummary": false,
+  "uid":          "3f2a1b...",
+  "cached":       true,
+  "turns":        6,
+  "hasSummary":   false,
   "contextUsage": 18,
-  "createdAt": 1718000000000,
-  "updatedAt": 1718000500000
+  "images":       ["photo.jpg"],
+  "imageMode":    "on",
+  "createdAt":    1718000000000,
+  "updatedAt":    1718000500000
 }
 ```
 
@@ -248,6 +293,58 @@ curl -X DELETE http://localhost:3000/context_chat/3f2a1b...
 
 ---
 
+## Personas
+
+Personas are JSON files in `personas/` that set the model's system prompt and
+optionally override inference parameters. The filename (without `.json`) is the
+persona name used in requests.
+
+```json
+{
+  "description": "Terse technical assistant",
+  "system":      "You are a concise technical assistant. Answer directly and briefly.",
+  "options":     { "temperature": 0.3, "repeat_penalty": 1.1 }
+}
+```
+
+Only `system` and `options` are used at runtime; `description` is ignored.
+`options` are overridable per-request — request-level `options` take precedence
+over persona `options`. Three starter personas ship with the project:
+`default`, `concise`, and `friendly`.
+
+A missing or malformed persona file returns **424 Failed Dependency** with a
+descriptive error message.
+
+---
+
+## Image context in `/context_chat`
+
+When an image is uploaded to a `/context_chat` turn, the gateway runs a
+two-step pipeline before responding to the user's prompt:
+
+1. **Verbalization** — the model is asked to describe the image in detail. The
+   description is stored in the session under the original filename and appended
+   to history as `[image: filename.jpg]\n<description>`. The raw image is not
+   retained between turns.
+
+2. **Direct vision on upload turn** — the raw image is also attached to the
+   current inference, so the model both sees the image directly *and* has the
+   description in its history for future turns.
+
+On subsequent text-only turns the model works from the description. If it
+detects that the user is referring to an image but none has been uploaded to
+the current turn, it will acknowledge the description is available and suggest
+re-uploading if direct examination is needed. This behaviour is prompt-guided
+and best-effort — it works well in practice but cannot be asserted
+deterministically.
+
+Re-uploading the same filename replaces the stored description. `image_mode`
+is automatically set to `'on'` whenever an image is added, and can be turned
+`'off'` by the caller to suppress image-awareness in the system prompt while
+leaving descriptions intact in history.
+
+---
+
 ## Context management and summarisation
 
 Each `context_chat` session accumulates turns as `{role, content}` objects.
@@ -256,17 +353,16 @@ After every exchange, the server estimates the token count of the full history
 `CONTEXT_SUMMARIZE_THRESHOLD` percent of `MODEL_CONTEXT_TOKENS`.
 
 When the threshold is crossed, the server runs a summarisation pass **inline**
-(the current request waits for it) before returning a response. The process:
+before returning a response:
 
-1. The most recent `CONTEXT_SUMMARY_KEEP_RECENT` raw turns are set aside verbatim.
+1. The most recent `CONTEXT_SUMMARY_KEEP_RECENT` raw turns are kept verbatim.
 2. All older raw turns are sent to the model with a compression prompt.
 3. The result replaces those turns as a single `role: "summary"` turn at the head
    of the history.
-4. Any existing summary turn is incorporated into the new one rather than
-   re-summarised — there is always at most one summary turn in a session.
+4. Any existing summary turn is incorporated into the new one — there is always
+   at most one summary turn in a session.
 
-The `context_usage` value in the response resets to a lower percentage after
-compression, reflecting the reduced token count of the compressed history.
+The `context_usage` value resets to a lower percentage after compression.
 
 ---
 
@@ -277,20 +373,22 @@ Client
   │
   ▼
 Fastify (server.js)
-  │  validates & parses multipart/JSON
+  │  parses multipart / JSON
   ▼
-routes.js  ──►  queue.js (p-queue, concurrency=1, cap=20)
-                    │
-                    ▼
-              modelManager.js   ←── idle TTL timer
-                    │  ensureLoaded() / touch()
-                    ▼
-              ollama.js  ──HTTP──►  Ollama :11434
-                                        │
-                                    gemma4:e4b
+routes.js ──► queue.js (p-queue, concurrency=1, cap=20)
+                  │
+                  ▼
+            modelManager.js  ←── idle TTL timer
+                  │  ensureLoaded() / touch()
+                  ▼
+            ollama.js  ──HTTP──►  Ollama :11434
+                                      │
+                                  gemma4:e4b
 
-routes.js  ──►  sessions.js  ──►  disk (sessions/*.json)
-               (context_chat)
+routes.js ──► personas.js  ──►  personas/*.json
+routes.js ──► sessions.js  ──►  disk (sessions/*.json)
+              (context_chat       images: verbalized descriptions
+               image pipeline)    imageMode: on | off
 ```
 
 **State machine (ModelManager):**

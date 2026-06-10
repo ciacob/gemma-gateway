@@ -9,6 +9,8 @@ npm test              # run all tests once
 npm run test:watch    # re-run on file changes
 ```
 
+Current coverage: **132 tests across 6 files**, all passing.
+
 ---
 
 ## Design philosophy
@@ -57,8 +59,32 @@ Covers:
 - `chat()` — reply extraction, history forwarding, image attachment (base64
   `images` array), audio embedding (data-URI in content), non-2xx error, empty
   response fallback
+- `chat()` with `system` prompt — prepended as first message before history,
+  absent when not provided
+- `chat()` with `options` — forwarded in request body, absent when not provided
 - Audio MIME detection — all four magic-byte prefixes (MP3/ID3, WAV/RIFF, FLAC,
   OGG) and the unknown-format fallback
+
+---
+
+### `test/personas.test.js`
+
+Tests the `createPersonaManager({ fs, personasDir })` factory from
+`src/personas.js`.
+
+**Injected fake:**
+
+The `makeFakeFs(files)` helper builds an in-memory filesystem from a plain
+object mapping full file paths to content strings. `existsSync` returns `true`
+for both exact file paths and directory prefixes (so the personas directory
+itself is considered to exist if any files live inside it).
+
+Covers `load()`: full persona with system + options; system-only; options-only;
+empty persona (neither field); unknown keys ignored; 424 on missing file; 424 on
+invalid JSON; 424 on unreadable file; error message includes persona name.
+
+Covers `list()`: alphabetical sort; exclusion of non-JSON files; empty array
+when directory absent.
 
 ---
 
@@ -94,13 +120,23 @@ threshold has been crossed. Tests that assert summarisation fires use
 protected, nothing to compress. This behaviour is tested explicitly in both
 directions.
 
-Covers: `estimateTokens`; `create` (cached and volatile); `resolve` (memory hit,
-disk hydration, unknown uid, volatile session not surviving restart); `remove`
+Core covers: `estimateTokens`; `create` (cached and volatile, `personaName`
+stored); `resolve` (memory hit, disk hydration, unknown uid, volatile session not
+surviving restart, legacy session hydrated with image defaults); `remove`
 (memory + disk, volatile, unknown); `status` (turn count, `hasSummary`,
-`contextUsage`); `appendAndMaybeCompress` (appends turns, returns 0–100 usage,
-triggers summarisation, never re-summarises existing summary turn, respects
-keep-recent window, resets usage after compression, disk write policy, throws on
-unknown uid, passes existing summary to chatFn on second compression).
+`contextUsage`, `images`, `imageMode`); `appendAndMaybeCompress` (appends turns,
+returns 0–100 usage, triggers summarisation, never re-summarises existing summary
+turn, respects keep-recent window, resets usage after compression, disk write
+policy, throws on unknown uid, passes existing summary to chatFn on second
+compression).
+
+Image tracking covers: `addImage()` (stores name + description, auto-enables
+`imageMode`, replaces on same filename, multiple distinct images, throws on
+unknown uid, persists when cached); `setImageMode()` (on/off toggle, invalid
+value throws, throws on unknown uid); `buildImageFragment()` (null when no
+images, null when mode is off, contains filename(s) when on, instructs model to
+offer re-upload); `status()` image fields (image names list, imageMode reflected);
+disk hydration of legacy sessions without image fields.
 
 ---
 
@@ -147,7 +183,15 @@ tests.
 | `ollamaClient`  | `makeOllama(replyText)` — records calls, returns fixed string |
 | `modelManager`  | `makeModelManager()` — in-memory state, no-op methods         |
 | `sessionStore`  | `createSessionStore` with fake fs and sequential UIDs         |
+| `personaManager`| `createPersonaManager` with in-memory persona definitions     |
 | `queue`         | `createQueue` with real p-queue, controlled concurrency       |
+
+**`buildMultipart(fields, file?)` helper:**
+
+Because `POST /context_chat` is multipart-only, tests use a lightweight
+`buildMultipart` function that constructs a valid multipart/form-data body and
+returns the matching `Content-Type` header. Text fields and an optional file
+attachment are supported.
 
 **Note on the 429 test:**
 
@@ -158,12 +202,27 @@ This is a valid test of the route's error-handling path. The underlying queue
 behaviour (filling up under real concurrency) is covered separately in
 `queue.test.js`.
 
-Covers: `GET /status`; `POST /unload`; `POST /chat` (valid prompt, history
-forwarding, missing prompt → 400, full queue → 429); `POST /context_chat` (new
-session with uid + reply + context_usage, volatile notice, no notice when cached,
-session resumption by uid, unknown uid → 404); `DELETE /context_chat/:uid`
-(success, unknown → 404); `GET /context_chat/:uid` (status snapshot, unknown →
-404).
+**Note on image pushback behaviour:**
+
+The model's behaviour of offering to re-examine an image when it detects a
+reference without a fresh upload is prompt-guided and non-deterministic. It is
+**not** covered by the test suite — the tests verify the gateway's plumbing
+(verbalization fires, description stored, `image_context` returned, `image_mode`
+toggle applied) but not the model's conversational response to image references.
+This is an intentional gap, documented here so it is not mistaken for an
+oversight.
+
+Covers: `GET /status` (model, queue, personas); `POST /unload`; `POST /chat`
+(valid prompt, history forwarding, missing prompt → 400, full queue → 429);
+`POST /context_chat` (new session, volatile notice, no-notice when cached,
+session resumption, unknown uid → 404); `DELETE /context_chat/:uid`; `GET
+/context_chat/:uid`; `GET /personas`; persona resolution (system + options
+forwarded, per-request options override persona options, default persona applied,
+424 on unknown persona, all of the above for `/context_chat`); image context chat
+(verbalization fires on upload, `verbalized` field in response, `image_context`
+in response, image_context carried on subsequent text turns, absent when no
+images, `image_mode: off` reflected in response, re-upload replaces not
+duplicates, missing prompt → 400).
 
 ---
 
@@ -179,3 +238,6 @@ Follow the established pattern:
    internal resources.
 4. Keep each test's setup self-contained — avoid shared mutable state between
    `it()` blocks.
+5. For behaviour that depends on model output (tone, persona compliance, image
+   re-upload prompting), document the gap explicitly rather than writing a
+   test that would be non-deterministic.
