@@ -368,34 +368,39 @@ The `context_usage` value resets to a lower percentage after compression.
 
 ## Architecture
 
-```
-Client
-  │
-  ▼
-Fastify (server.js)
-  │  parses multipart / JSON
-  ▼
-routes.js ──► queue.js (p-queue, concurrency=1, cap=20)
-                  │
-                  ▼
-            modelManager.js  ←── idle TTL timer
-                  │  ensureLoaded() / touch()
-                  ▼
-            ollama.js  ──HTTP──►  Ollama :11434
-                                      │
-                                  gemma4:e4b
+```mermaid
+flowchart TD
+    Client -->|multipart / JSON| Fastify["Fastify\n(server.js)"]
+    Fastify --> routes["routes.js"]
 
-routes.js ──► personas.js  ──►  personas/*.json
-routes.js ──► sessions.js  ──►  disk (sessions/*.json)
-              (context_chat       images: verbalized descriptions
-               image pipeline)    imageMode: on | off
+    routes -->|every request| queue["queue.js\np-queue · concurrency=1 · cap=20"]
+    queue --> modelManager["modelManager.js"]
+    modelManager -->|ensureLoaded / touch| ollama["ollama.js"]
+    ollama -->|HTTP| Ollama["Ollama :11434"]
+    Ollama --> model["gemma4:e4b"]
+
+    idleTimer["idle TTL timer"] -->|fires| modelManager
+
+    routes -->|persona name| personas["personas.js"]
+    personas -->|reads| personaFiles["personas/*.json"]
+
+    routes -->|context_chat| sessions["sessions.js"]
+    sessions -->|cached sessions| disk["sessions/*.json"]
+    sessions -->|verbalized images\nimageMode on/off| disk
 ```
 
 **State machine (ModelManager):**
+
+```mermaid
+stateDiagram-v2
+    [*] --> UNLOADED
+    UNLOADED --> LOADING : ensureLoaded()
+    LOADING --> READY : loadModel() ok
+    LOADING --> UNLOADED : loadModel() error
+    READY --> UNLOADING : forceUnload()\nor idle TTL fires
+    UNLOADING --> UNLOADED : unloadModel() done
+    UNLOADED --> LOADING : next request
 ```
-UNLOADED → LOADING → READY → UNLOADING → UNLOADED
-              ↑                              │
-              └──────────── (next request) ──┘
-```
+
 The idle timer fires after `IDLE_TTL_SECONDS` of no `touch()` calls, which
 drives the `READY → UNLOADING → UNLOADED` transition.
